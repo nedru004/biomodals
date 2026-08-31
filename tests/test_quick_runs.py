@@ -8,7 +8,7 @@ Run one:    uv run --with modal --with pytest pytest tests/test_quick_runs.py -v
 
 Approximate run times (GPU):
     1-2 min       esm2, pdb2png, anarci, nextflow, minimap2, faspr, sasa, usalign
-    2-5 min       af2rank, chai1, boltz, boltzgen, iggm, ligandmpnn, tmol
+    2-5 min       af2rank, chai1, boltz, boltzgen, boltz_validate, iggm, ligandmpnn, tmol
     5-10 min      alphafold, diffdock, afdesign, rso, protenix, mber
     10-30 min     germinal
     30-60 min     bindcraft, proteinhunter
@@ -142,6 +142,52 @@ def test_boltz():
     _modal_run(
         "modal_boltz.py", "--input-yaml", "test_boltz.yaml",
         "--params-str", "--seed 42",
+    )
+
+
+def _minimal_complex_pdb() -> str:
+    """Two short chains with CA-only coordinates for Boltz validate tests."""
+    aa1to3 = {
+        "A": "ALA", "C": "CYS", "D": "ASP", "E": "GLU", "F": "PHE", "G": "GLY",
+        "H": "HIS", "I": "ILE", "K": "LYS", "L": "LEU", "M": "MET", "N": "ASN",
+        "P": "PRO", "Q": "GLN", "R": "ARG", "S": "SER", "T": "THR", "V": "VAL",
+        "W": "TRP", "Y": "TYR",
+    }
+    lines = ["HEADER    BOLTZ VALIDATE TEST"]
+    serial = 1
+
+    def add_chain(chain: str, seq: str, x0: float) -> None:
+        nonlocal serial
+        for i, aa in enumerate(seq):
+            res3 = aa1to3[aa]
+            x = x0 + i * 3.8
+            lines.append(
+                f"ATOM  {serial:5d}  CA  {res3} {chain}{i + 1:4d}    "
+                f"{x:8.3f}{0.0:8.3f}{0.0:8.3f}  1.00 50.00           C  "
+            )
+            serial += 1
+        lines.append("TER")
+
+    add_chain("A", "TDKLIFGKGTRVTVEP", 0.0)
+    add_chain("B", "GIVEQCCTSICS", 80.0)
+    lines.append("END")
+    return "\n".join(lines) + "\n"
+
+
+def test_boltz_validate():
+    pdb_dir = REPO_ROOT / "test_boltz_validate_pdbs"
+    pdb_dir.mkdir(exist_ok=True)
+    (pdb_dir / "design1.pdb").write_text(_minimal_complex_pdb())
+    _modal_run(
+        "modal_boltz_validate.py",
+        "--input-dir", str(pdb_dir),
+        "--binder-chain", "B",
+        "--target-chains", "A",
+        "--no-msa",
+        "--recycling-steps", "1",
+        "--diffusion-samples", "1",
+        "--run-name", "test",
+        timeout=900,
     )
 
 

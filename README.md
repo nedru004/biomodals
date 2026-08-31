@@ -22,6 +22,7 @@ Sorted alphabetically.
 - [ANARCI](#anarci) — antibody sequence annotation
 - [BindCraft](#bindcraft) — protein binder design
 - [Boltz](#boltz) — AF3-like open structure prediction
+- [Boltz validate](#boltz-validate) — rank binder designs (pLDDT, iPTM, RMSD)
 - [BoltzGen](#boltzgen) — generative structure model
 - [Chai-1](#chai-1) — AF3-like open structure prediction
 - [DiffDock](#diffdock) — small molecule docking
@@ -106,6 +107,33 @@ GPU=A100 uv run --with modal modal run --detach modal_bindcraft.py --input-pdb P
 printf 'sequences:\n    - protein:\n        id: A\n        sequence: TDKLIFGKGTRVTVEP\n' > test_boltz.yaml
 uv run --with modal modal run modal_boltz.py --input-yaml test_boltz.yaml --params-str "--seed 42"
 ```
+
+## Boltz validate
+Re-predict designed binders with Boltz-2, with and without the target, and rank
+them by interface confidence and RMSD to the designed coordinates.
+
+Each PDB/CIF in the input folder is parsed for sequences. Boltz then predicts
+the binder–target complex and the binder monomer. Output is `rankings.csv` on
+the `boltz-validate` volume (plus predicted structures).
+
+```bash
+# BindCraft Accepted folder on the bindcraft volume (A = target, B = binder)
+GPU=A100 uv run --with modal modal run --detach modal_boltz_validate.py \
+  --volume-name bindcraft --input-dir <run>/<target>/Accepted \
+  --binder-chain B --target-chains A
+
+# Local folder of complex structures
+GPU=A100 uv run --with modal modal run modal_boltz_validate.py \
+  --input-dir ./designs --binder-chain B --target-chains A --no-msa
+
+# later: modal volume get boltz-validate <run_name> ./out/boltz_validate/
+```
+
+Useful flags: `--no-msa` (single-sequence, faster), `--no-monomer`,
+`--recycling-steps 10 --diffusion-samples 5` (more accurate, slower),
+`--use-potentials`, `--target-pdb` when designs are binder-only.
+A volume other than `bindcraft` / `proteinhunter` needs
+`DESIGN_VOLUME=<name>` so Modal can mount it.
 
 ## BoltzGen
 [BoltzGen](https://github.com/HannesStark/boltzgen), generative model for biomolecular structures.
@@ -297,9 +325,11 @@ GPU=A100 uv run --with modal modal run --detach modal_proteinhunter.py \
 ```
 
 Useful flags: `--lengths 90,150`, `--contact-residues 2,3,10` (hotspots),
-`--num-cycles 5`, `--msa-mode mmseqs` (or `single`), `--percent-x 100`,
-`--cyclic` for peptide binders, `--ligand-ccd SAM` for small-molecule targets.
-Needs ~20–25 GB VRAM; ~7–10 min per design on an H100.
+`--num-cycles 5`, `--msa-mode mmseqs` (or `single` to skip the ColabFold MSA
+server), `--percent-x 100`, `--cyclic` for peptide binders, `--ligand-ccd SAM`
+for small-molecule targets. If the ColabFold MSA download fails, the job
+retries and then continues without an MSA. Needs ~20–25 GB VRAM; ~7–10 min
+per design on an H100.
 
 ## Protenix
 
