@@ -7,7 +7,17 @@
 """Runs the BindCraft protein binder design pipeline on Modal.
 
 Adapting:
-https://colab.research.google.com/github/martinpacesa/BindCraft/blob/main/notebooks/BindCraft.ipynb
+    https://colab.research.google.com/github/martinpacesa/BindCraft/blob/main/notebooks/BindCraft.ipynb
+
+Results are written to the Modal Volume named "bindcraft". Always use --detach
+so you can close the terminal; the job keeps running on Modal:
+
+    GPU=A100 uv run --with modal modal run --detach modal_bindcraft.py \\
+      --input-pdb PDL1.pdb --number-of-final-designs 1
+
+Download results later:
+
+    modal volume get bindcraft <run_name> ./out/bindcraft/
 
 Approximate cost for 3 designs, PDL1.pdb only:
 - A10G = $2, 1.5h
@@ -18,12 +28,16 @@ Approximate cost for 3 designs, PDL1.pdb only:
 import os
 from pathlib import Path
 
-from modal import App, Image
+from modal import App, Image, Volume
 
 # It is harder to provision GPUs if you set the timeout too high
 GPU = os.environ.get("GPU", "L40S")
-TIMEOUT = int(os.environ.get("TIMEOUT", 300))
+TIMEOUT = int(os.environ.get("TIMEOUT", 24)) * 60 * 60
 print(f"Using GPU {GPU}; TIMEOUT {TIMEOUT}")
+
+VOLUME_NAME = "bindcraft"
+VOLUME = Volume.from_name(VOLUME_NAME)
+VOLUME_MOUNT = f"/{VOLUME_NAME}"
 
 
 def set_up_pyrosetta():
@@ -44,7 +58,7 @@ image = (
     .uv_pip_install("pyrosetta-installer")
     .run_commands(
         "git clone https://github.com/martinpacesa/BindCraft /root/bindcraft",
-        "cd /root/bindcraft && git checkout c0a48d595d4976694aa979438712ac94c16620bb",
+        "cd /root/bindcraft",
         "chmod +x /root/bindcraft/functions/dssp",
         "chmod +x /root/bindcraft/functions/DAlphaBall.gcc",
     )
@@ -68,7 +82,12 @@ image = (
 app = App("bindcraft", image=image)
 
 
-@app.function(image=image, gpu=GPU, timeout=TIMEOUT * 60)
+@app.function(
+    image=image,
+    gpu=GPU,
+    timeout=TIMEOUT,
+    volumes={VOLUME_MOUNT: VOLUME},
+)
 def bindcraft(
     design_path,
     binder_name,
@@ -86,7 +105,7 @@ def bindcraft(
     """Executes the BindCraft pipeline to design protein binders against a target structure.
 
     Args:
-        design_path (str): Path for design outputs within the container.
+        design_path (str): Path for design outputs on the bindcraft Volume.
         binder_name (str): Name for the binder design project.
         pdb_str (str): PDB file content as a string.
         chains (str): Target chain(s) in the PDB.
@@ -100,8 +119,7 @@ def bindcraft(
         max_trajectories (int | None): Maximum number of design trajectories to run.
 
     Returns:
-        list[tuple[Path, bytes]]: A list of tuples, where each tuple contains the relative output
-                                  file path from `design_path` and its byte content.
+        dict: Summary with volume name, design path, and accepted design count.
     """
     import json
     import os
@@ -1034,6 +1052,8 @@ def bindcraft(
 
             # increase trajectory number
             trajectory_n += 1
+            # Persist partial results so they survive disconnect / preemption
+            VOLUME.commit()
 
     ### Script finished
     elapsed_time = time.time() - script_start_time
@@ -1087,11 +1107,14 @@ def bindcraft(
     # save the final_df to final_csv
     final_df.to_csv(final_csv, index=False)
 
-    out_dir = design_path
-    return [
-        (out_file.relative_to(out_dir), open(out_file, "rb").read())
-        for out_file in Path(out_dir).glob("**/*.*")
-    ]
+    VOLUME.commit()
+    print(f"Results committed to volume '{VOLUME_NAME}' at {design_path}")
+    return {
+        "volume": VOLUME_NAME,
+        "design_path": design_path,
+        "accepted_designs": len(accepted_binders),
+        "trajectories": trajectory_n,
+    }
 
 
 @app.local_entrypoint()
@@ -1103,10 +1126,13 @@ def main(
     number_of_final_designs: int = 1,
     max_trajectories: int | None = None,
     binder_name: str | None = None,
-    out_dir: str = "./out/bindcraft",
     run_name: str | None = None,
 ):
     """Local entrypoint to run BindCraft binder design.
+
+    Uses spawn().get() (required for long detached jobs). Run with
+    `modal run --detach` so closing the terminal does not kill the job.
+    Results are stored on the Modal Volume named "bindcraft".
 
     Args:
         input_pdb (str): Path to the input PDB file.
@@ -1122,10 +1148,8 @@ def main(
                                                  Defaults to None.
         binder_name (str | None, optional): Name for the binder design project. If None, it's derived
                                             from the input PDB filename. Defaults to None.
-        out_dir (str, optional): Directory to save the output files. Defaults to "./out/bindcraft".
-        run_name (str | None, optional): Optional name for the run, used to create a subdirectory
-                                         in `out_dir`. If None, a timestamp-based name is used.
-                                         Defaults to None.
+        run_name (str | None, optional): Optional name for the run subdirectory on the volume.
+                                         If None, a timestamp-based name is used. Defaults to None.
 
     Returns:
         None
@@ -1133,13 +1157,24 @@ def main(
     from datetime import datetime
 
     today = datetime.now().strftime("%Y%m%d%H%M")[2:]
+    run_subdir = run_name or today
 
     pdb_str = open(input_pdb).read()
     binder_name = binder_name or Path(input_pdb).stem
-    design_path = f"/tmp/BindCraft/{binder_name}/"
+    design_path = f"{VOLUME_MOUNT}/{run_subdir}/{binder_name}/"
     lengths_list = [int(i) for i in lengths.split(",")]
 
-    outputs = bindcraft.remote(
+    print(f"Results will be written to volume '{VOLUME_NAME}' at {design_path}")
+    print(
+        "Run with --detach; you can close the terminal and the job will keep going."
+    )
+    print(f"Download later: modal volume get {VOLUME_NAME} {run_subdir} ./out/bindcraft/")
+    print(f"List volume:     modal volume ls {VOLUME_NAME} {run_subdir}")
+
+    # spawn().get() (not bare spawn, not remote) is required for long --detach
+    # jobs: bare spawn returns immediately and the ephemeral app shuts down;
+    # remote() FunctionCalls expire after 24h.
+    result = bindcraft.spawn(
         design_path=design_path,
         binder_name=binder_name,
         pdb_str=pdb_str,
@@ -1148,10 +1183,5 @@ def main(
         lengths=lengths_list,
         number_of_final_designs=number_of_final_designs,
         max_trajectories=max_trajectories,
-    )
-
-    for out_file, out_content in outputs:
-        output_path = Path(out_dir) / (run_name or today) / out_file
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, "wb") as out:
-            out.write(out_content)
+    ).get()
+    print(f"BindCraft finished: {result}")
