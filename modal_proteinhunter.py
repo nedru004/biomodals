@@ -169,6 +169,102 @@ def pdb_chains_to_seqs(pdb_str: str, chains: str) -> str:
     return ":".join("".join(seqs[c]) for c in wanted)
 
 
+def _patch_colabfold_msa() -> None:
+    """Work around flaky / migrated ColabFold MSA downloads.
+
+    api.colabfold.com often reports COMPLETE then returns JSON 404 for
+    GET /result/download/{id}. Their gateway rewrites that to
+    /compute/v1/msa/result/download/{id}, which is not a registered route.
+    Try alternate paths and hosts, then fall back to a single-sequence MSA.
+    """
+    import shutil
+    import tarfile
+    import time
+    from urllib.parse import urlparse
+
+    import requests
+
+    orig_get = requests.get
+    download_suffixes = (
+        "/result/download/{id}",
+        "/api/result/download/{id}",
+        "/ticket/{id}/download",
+    )
+    extra_hosts = ("https://api-105.colabfold.com",)
+
+    def get_with_long_download(*args, **kwargs):
+        url = args[0] if args else kwargs.get("url", "")
+        if not (isinstance(url, str) and "download" in url):
+            return orig_get(*args, **kwargs)
+
+        extra = dict(kwargs)
+        extra.pop("url", None)
+        extra["timeout"] = (6.02, 600)
+        rest = args[1:] if args else ()
+        job_id = url.rstrip("/").rsplit("/", 1)[-1]
+        parsed = urlparse(url)
+        bases = [f"{parsed.scheme}://{parsed.netloc}"]
+        for host in extra_hosts:
+            if host not in bases:
+                bases.append(host)
+
+        last_preview = b""
+        last_status = None
+        for base in bases:
+            for suffix in download_suffixes:
+                candidate = f"{base}{suffix.format(id=job_id)}"
+                print(f"MSA download trying {candidate}")
+                response = orig_get(candidate, *rest, **extra)
+                payload = response.content or b""
+                if len(payload) >= 100 and payload[:2] == b"\x1f\x8b":
+                    print(f"MSA download ok ({len(payload)} bytes)")
+                    return response
+                last_status = response.status_code
+                last_preview = payload[:200]
+                print(
+                    f"  not gzip (status={last_status} "
+                    f"len={len(payload)} preview={last_preview!r})"
+                )
+        raise requests.RequestException(
+            f"MSA download 404/invalid for job {job_id} "
+            f"(status={last_status} preview={last_preview!r})"
+        )
+
+    requests.get = get_with_long_download
+
+    import model_utils
+    import pipeline as pipeline_mod
+
+    orig_process_msa = pipeline_mod.process_msa
+
+    def process_msa_robust(chain_id, sequence, msa_dir):
+        last_err = None
+        for attempt in range(1, 4):
+            try:
+                return orig_process_msa(chain_id, sequence, msa_dir)
+            except (tarfile.ReadError, Exception) as err:
+                last_err = err
+                print(f"WARNING: ColabFold MSA attempt {attempt}/3 failed: {err}")
+                for leftover in Path(msa_dir).glob(f"{chain_id}*"):
+                    if leftover.is_dir():
+                        shutil.rmtree(leftover, ignore_errors=True)
+                    else:
+                        leftover.unlink(missing_ok=True)
+                time.sleep(5 * attempt)
+        print(
+            "WARNING: ColabFold MSA download is a JSON 404 from their API "
+            f"gateway ({last_err}). Continuing with single-sequence MSA "
+            "(equivalent to --msa-mode single)."
+        )
+        return "empty"
+
+    pipeline_mod.process_msa = process_msa_robust
+    model_utils.process_msa = process_msa_robust
+    print(
+        "ColabFold MSA: try alternate download routes/hosts, then single-seq fallback"
+    )
+
+
 @app.function(
     image=image,
     gpu=GPU,
@@ -309,6 +405,7 @@ def proteinhunter(
     from design import parse_args, print_args
     from pipeline import ProteinHunter_Boltz
 
+    _patch_colabfold_msa()
     args = parse_args()
     print_args(args)
     Path(save_dir).mkdir(parents=True, exist_ok=True)
