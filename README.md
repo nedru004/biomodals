@@ -36,6 +36,7 @@ Sorted alphabetically.
 - [minimap2](#minimap2-short-reads-example) — short-read alignment
 - [nextflow](#nextflow) — nextflow hello-world image
 - [pdb2png](#pdb2png) — PDB → PNG rendering via pymol
+- [Protein Hunter](#protein-hunter) — protein binder design
 - [Protenix](#protenix) — AF3 reproduction
 - [RSO](#rso-binder-design) — Rejection Sampling Optimization binder design
 - [SASA](#sasa-solvent-accessible-surface-area) — solvent-accessible surface area
@@ -89,10 +90,14 @@ uv run --with modal modal run modal_anarci.py --input-faa test_anarci.faa
 
 ## BindCraft
 
-Basic PDL1 binder (example from https://github.com/martinpacesa/BindCraft)
+Basic PDL1 binder (example from https://github.com/martinpacesa/BindCraft).
+Results go to the Modal Volume `bindcraft`. Use `--detach` so the job keeps
+running after you disconnect:
+
 ```bash
 wget https://raw.githubusercontent.com/martinpacesa/BindCraft/refs/heads/main/example/PDL1.pdb
-GPU=A100 uv run --with modal modal run modal_bindcraft.py --input-pdb PDL1.pdb --number-of-final-designs 1
+GPU=A100 uv run --with modal modal run --detach modal_bindcraft.py --input-pdb PDL1.pdb --number-of-final-designs 1
+# later: modal volume get bindcraft <run_name> ./out/bindcraft/
 ```
 
 ## Boltz
@@ -267,6 +272,34 @@ A simple pymol-based script to convert PDBs to PNGs for easy output viewing.
 wget https://files.rcsb.org/download/1YWI.pdb
 uv run --with modal modal run modal_pdb2png.py --input-pdb 1YWI.pdb --protein-zoom 0.8 --protein-color 240,200,190
 ```
+
+## Protein Hunter
+
+[Protein Hunter](https://github.com/yehlincho/Protein-Hunter) designs de novo
+protein binders with Boltz-2 hallucination plus LigandMPNN sequence design.
+Results go to the Modal Volume `proteinhunter`. Create the volume once, then
+use `--detach` so the job keeps running after you disconnect:
+
+```bash
+modal volume create proteinhunter
+
+# PDL1 binder (example sequence from Protein Hunter)
+GPU=A100 uv run --with modal modal run --detach modal_proteinhunter.py \
+  --protein-seqs AFTVTVPKDLYVVEYGSNMTIECKFPVEKQLDLAALIVYWEMEDKNIIQFVHGEEDLKVQHSSYRQRARLLKDQLSLGNAALQITDVKLQDAGVYRCMISYGGADYKRITVKVNAPYAAALE \
+  --num-designs 1
+
+# Same workflow from a PDB (sequences are extracted from --target-chains)
+wget https://raw.githubusercontent.com/martinpacesa/BindCraft/refs/heads/main/example/PDL1.pdb
+GPU=A100 uv run --with modal modal run --detach modal_proteinhunter.py \
+  --input-pdb PDL1.pdb --target-chains A --num-designs 1
+
+# later: modal volume get proteinhunter <run_name> ./out/proteinhunter/
+```
+
+Useful flags: `--lengths 90,150`, `--contact-residues 2,3,10` (hotspots),
+`--num-cycles 5`, `--msa-mode mmseqs` (or `single`), `--percent-x 100`,
+`--cyclic` for peptide binders, `--ligand-ccd SAM` for small-molecule targets.
+Needs ~20–25 GB VRAM; ~7–10 min per design on an H100.
 
 ## Protenix
 

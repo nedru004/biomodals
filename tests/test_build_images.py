@@ -8,7 +8,7 @@ Run one:    uv run run_tests.py tests/test_build_images.py -k alphafold
 
 Expected first-build times (uncached):
     5-10 min      most apps
-    15-30 min     afdesign, alphafold, bindcraft, rso (large pip installs)
+    15-30 min     afdesign, alphafold, bindcraft, proteinhunter, rso (large pip installs)
     1-2 hours     diffdock (downloads ~3GB of ESM2 + DiffDock models)
 """
 

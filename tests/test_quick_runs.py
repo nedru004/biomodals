@@ -11,11 +11,12 @@ Approximate run times (GPU):
     2-5 min       af2rank, chai1, boltz, boltzgen, iggm, ligandmpnn, tmol
     5-10 min      alphafold, diffdock, afdesign, rso, protenix, mber
     10-30 min     germinal
-    30-60 min     bindcraft
+    30-60 min     bindcraft, proteinhunter
 
 Approximate cost (Modal GPU compute, ~$1-3/hr depending on tier):
     Running the full suite once: ~$5-15.
     bindcraft alone (A100): ~$2-4.
+    proteinhunter (A100, 1 design / 1 cycle): ~$1-3.
     germinal: ~$1-2.
     The rest combined: ~$2-4.
 """
@@ -186,6 +187,20 @@ def test_bindcraft():
         "modal_bindcraft.py",
         "--input-pdb", "PDL1.pdb",
         "--number-of-final-designs", "1",
+        timeout=3600,
+    )
+
+
+@pytest.mark.slow
+def test_proteinhunter():
+    _modal_run(
+        "modal_proteinhunter.py",
+        "--protein-seqs",
+        "AFTVTVPKDLYVVEYGSNMTIECKFPVEKQLDLAALIVYWEMEDKNIIQFVHGEEDLKVQHSSYRQRARLLKDQLSLGNAALQITDVKLQDAGVYRCMISYGGADYKRITVKVNAPYAAALE",
+        "--num-designs", "1",
+        "--num-cycles", "1",
+        "--lengths", "90,90",
+        "--msa-mode", "single",
         timeout=3600,
     )
 

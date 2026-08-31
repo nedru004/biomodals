@@ -31,6 +31,7 @@ def pytest_collection_modifyitems(config, items):
             "These USE GPU cloud resources and COST MONEY.\n"
             "Full suite: ~30-60 min parallel (1-2 hr sequential), ~$5-15.\n"
             "Slowest apps: bindcraft (30-60 min, A100, ~$2-4),\n"
+            "              proteinhunter (10-30 min, A100, ~$1-3),\n"
             "              germinal (10-30 min, ~$1-2).\n"
             "Ctrl-C now to abort.\n"
             "============================================================\n",
