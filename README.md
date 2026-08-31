@@ -303,8 +303,10 @@ uv run --with modal modal run modal_pdb2png.py --input-pdb 1YWI.pdb --protein-zo
 
 ## Protein Hunter
 
-[Protein Hunter](https://github.com/yehlincho/Protein-Hunter) designs de novo
-protein binders with Boltz-2 hallucination plus LigandMPNN sequence design.
+[Protein Hunter](https://github.com/nedru004/Protein-Hunter) (fork of
+[yehlincho/Protein-Hunter](https://github.com/yehlincho/Protein-Hunter))
+designs de novo protein binders with Boltz-2 hallucination plus LigandMPNN
+sequence design. The fork can lock binder residues during MPNN redesign.
 Results go to the Modal Volume `proteinhunter`. Create the volume once, then
 use `--detach` so the job keeps running after you disconnect:
 
@@ -321,15 +323,38 @@ wget https://raw.githubusercontent.com/martinpacesa/BindCraft/refs/heads/main/ex
 GPU=A100 uv run --with modal modal run --detach modal_proteinhunter.py \
   --input-pdb PDL1.pdb --target-chains A --num-designs 1
 
+# Redesign an existing binder, keeping selected 1-indexed residues
+GPU=A100 uv run --with modal modal run --detach modal_proteinhunter.py \
+  --protein-seqs AFTVTVPKDLYVVEYGSNMTIECKFPVEKQLDLAALIVYWEMEDKNIIQFVHGEEDLKVQHSSYRQRARLLKDQLSLGNAALQITDVKLQDAGVYRCMISYGGADYKRITVKVNAPYAAALE \
+  --seq GPDRERARELARILLKVIKLSDSPEARRQLLRNLEELAEKYKDPEVRRILEEAERYIK \
+  --fixed-positions 12,15,20-24 --num-designs 1
+
+# Motif scaffold: letters stay fixed, X is redesigned
+GPU=A100 uv run --with modal modal run --detach modal_proteinhunter.py \
+  --protein-seqs AFTVTVPKDLYVVEYGSNMTIECKFPVEKQLDLAALIVYWEMEDKNIIQFVHGEEDLKVQHSSYRQRARLLKDQLSLGNAALQITDVKLQDAGVYRCMISYGGADYKRITVKVNAPYAAALE \
+  --seq XXXXXXXXXXXWXXYXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX --num-designs 1
+
+# Refine designed complexes in a folder (A = target, B = binder)
+GPU=A100 uv run --with modal modal run --detach modal_proteinhunter.py \
+  --input-dir ./designs --binder-chain B --target-chains A --num-designs 1
+# results: ./designs/proteinhunter/  and volume proteinhunter/<run_name>/
+
 # later: modal volume get proteinhunter <run_name> ./out/proteinhunter/
 ```
 
 Useful flags: `--lengths 90,150`, `--contact-residues 2,3,10` (hotspots),
 `--num-cycles 5`, `--msa-mode mmseqs` (or `single` to skip the ColabFold MSA
 server), `--percent-x 100`, `--cyclic` for peptide binders, `--ligand-ccd SAM`
-for small-molecule targets. If the ColabFold MSA download fails, the job
-retries and then continues without an MSA. Needs ~20–25 GB VRAM; ~7–10 min
-per design on an H100.
+for small-molecule targets, `--template-path local.cif` (uploaded automatically;
+repeat once per target when using `--template-cif-chain-id B,C`),
+`--seq` plus `--fixed-positions 12,15,20-24` to redesign a binder while
+keeping important residues (or put `X` in `--seq` for positions to redesign).
+Folder refine (`--input-dir`) extracts the binder sequence from `--binder-chain`
+(default `B`, BindCraft-style; BoltzGen often uses `A`) and writes into
+`<input-dir>/proteinhunter/` (`--out-subdir` to rename). Binder-only PDBs need
+`--target-pdb` or `--protein-seqs`. Parallel jobs: `MAX_CONTAINERS=4` (env). If
+the ColabFold MSA download fails, the job retries and then continues without an
+MSA. Needs ~20–25 GB VRAM; ~7–10 min per design on an H100.
 
 ## Protenix
 
