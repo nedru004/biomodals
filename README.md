@@ -19,6 +19,7 @@ Sorted alphabetically.
 - [AF2Rank](#af2rank) — structure ranking via AF2 prediction
 - [AFDesign](#afdesign) — peptide/binder design via AlphaFold2
 - [AlphaFold-Multimer](#alphafold-multimer) — multimer structure prediction
+- [AlphaFast validate](#alphafast-validate) — rank binder designs with AlphaFold 3 via AlphaFast
 - [ANARCI](#anarci) — antibody sequence annotation
 - [BindCraft](#bindcraft) — protein binder design
 - [Boltz](#boltz) — AF3-like open structure prediction
@@ -80,6 +81,40 @@ A very basic implementation.
 wget https://www.rcsb.org/fasta/entry/3NIT -O 3NIT.faa
 uv run --with modal modal run modal_alphafold.py --input-faa 3NIT.faa
 ```
+
+## AlphaFast validate
+Re-predict designed binders with [AlphaFast](https://github.com/RomeroLab/alphafast)
+(AlphaFold 3), with and without the target, and rank them by interface
+confidence and RMSD to the designed coordinates.
+
+This uses AlphaFast's published container (`romerolabduke/alphafast:latest`)
+and the same `af3-weights` volume as [their Modal setup](https://github.com/RomeroLab/alphafast#modal-setup).
+
+Upload weights once:
+
+```bash
+uv run --with modal modal run modal_alphafast_validate.py \
+  --upload-weights /path/to/af3.bin.zst
+```
+
+```bash
+# BindCraft Accepted folder on the bindcraft volume (A = target, B = binder)
+GPU=A100-80GB uv run --with modal modal run --detach modal_alphafast_validate.py \
+  --volume-name bindcraft --input-dir <run>/<target>/Accepted \
+  --binder-chain B --target-chains A
+
+# Local folder of complex structures
+GPU=A100-80GB uv run --with modal modal run modal_alphafast_validate.py \
+  --input-dir ./designs --binder-chain B --target-chains A --no-msa
+
+# later: modal volume get alphafast-validate <run_name> ./out/alphafast_validate/
+```
+
+Useful flags: `--no-msa` (single-sequence, faster), `--no-monomer`,
+`--recycling-steps 10 --diffusion-samples 5` (paper defaults; slower),
+`--target-pdb` when designs are binder-only.
+A volume other than `bindcraft` / `proteinhunter` needs
+`DESIGN_VOLUME=<name>` so Modal can mount it.
 
 ## ANARCI
 A tool for annotating antibody sequences https://github.com/oxpig/ANARCI
