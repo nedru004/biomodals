@@ -22,6 +22,7 @@ Sorted alphabetically.
 - [AlphaFast validate](#alphafast-validate) — rank binder designs with AlphaFold 3 via AlphaFast
 - [ANARCI](#anarci) — antibody sequence annotation
 - [BindCraft](#bindcraft) — protein binder design
+- [BindCraft2](#bindcraft2) — protein binder design (BC2)
 - [Boltz](#boltz) — AF3-like open structure prediction
 - [Boltz validate](#boltz-validate) — rank binder designs (pLDDT, iPTM, RMSD)
 - [BoltzGen](#boltzgen) — generative structure model
@@ -40,6 +41,7 @@ Sorted alphabetically.
 - [pdb2png](#pdb2png) — PDB → PNG rendering via pymol
 - [Protein Hunter](#protein-hunter) — protein binder design
 - [Protenix](#protenix) — AF3 reproduction
+- [RFdiffusion3](#rfdiffusion3) — all-atom binder / motif design + SolubleMPNN
 - [RSO](#rso-binder-design) — Rejection Sampling Optimization binder design
 - [SASA](#sasa-solvent-accessible-surface-area) — solvent-accessible surface area
 - [tmol](#tmol-rosetta-energy-scoring) — GPU Rosetta energy scoring
@@ -86,6 +88,9 @@ uv run --with modal modal run modal_alphafold.py --input-faa 3NIT.faa
 Re-predict designed binders with [AlphaFast](https://github.com/RomeroLab/alphafast)
 (AlphaFold 3), with and without the target, and rank them by interface
 confidence and RMSD to the designed coordinates.
+Each target chain gets a ColabFold unpaired MSA. Distinct target chains
+are also paired with each other (the binder is left unpaired).
+Pass `--templates` to use the design PDB as a target-chain template.
 
 This uses AlphaFast's published container (`romerolabduke/alphafast:latest`)
 and the same `af3-weights` volume as [their Modal setup](https://github.com/RomeroLab/alphafast#modal-setup).
@@ -103,6 +108,16 @@ GPU=A100-80GB uv run --with modal modal run --detach modal_alphafast_validate.py
   --volume-name bindcraft --input-dir <run>/<target>/Accepted \
   --binder-chain B --target-chains A
 
+# BindCraft2 ranked complexes (CIF; A = target, B = binder)
+GPU=A100-80GB uv run --with modal modal run --detach modal_alphafast_validate.py \
+  --volume-name bindcraft2 --input-dir <run>/<campaign>/3_Ranked \
+  --binder-chain B --target-chains A
+
+# RFD3 + SolubleMPNN (binder A; motif RMSD from each design's diffused_index_map)
+GPU=A100-80GB uv run --with modal modal run --detach modal_alphafast_validate.py \
+  --volume-name rfd3 --input-dir <run>/mpnn --recursive \
+  --binder-chain A --target-chains B,C
+
 # Local folder of complex structures
 GPU=A100-80GB uv run --with modal modal run modal_alphafast_validate.py \
   --input-dir ./designs --binder-chain B --target-chains A --no-msa
@@ -110,11 +125,17 @@ GPU=A100-80GB uv run --with modal modal run modal_alphafast_validate.py \
 # later: modal volume get alphafast-validate <run_name> ./out/alphafast_validate/
 ```
 
-Useful flags: `--no-msa` (single-sequence, faster), `--no-monomer`,
-`--recycling-steps 10 --diffusion-samples 5` (paper defaults; slower),
-`--target-pdb` when designs are binder-only.
-A volume other than `bindcraft` / `proteinhunter` needs
-`DESIGN_VOLUME=<name>` so Modal can mount it.
+Useful flags: `--no-msa` (single-sequence, faster), `--no-pair` (skip
+target-chain pairing), `--no-monomer`, `--templates` (design PDB as a
+target-chain template), `--recycling-steps 10 --diffusion-samples 5`
+(paper defaults; slower), `--target-pdb` when designs are binder-only,
+`--motif-residues A4,A6,A18` or `--motif-json` to override auto motif
+lookup. A volume other than `bindcraft` / `bindcraft2` / `proteinhunter` /
+`rfd3` needs `DESIGN_VOLUME=<name>` so Modal can mount it.
+
+For motif scaffolding, `rankings.csv` also includes `rmsd_motif` (Kabsch
+on motif CAs) and `rmsd_motif_on_target` (same atoms after aligning the
+target). Pass `--binder-chain A` for RFD3; BindCraft defaults stay B/A.
 
 ## ANARCI
 A tool for annotating antibody sequences https://github.com/oxpig/ANARCI
@@ -126,15 +147,64 @@ uv run --with modal modal run modal_anarci.py --input-faa test_anarci.faa
 
 ## BindCraft
 
-Basic PDL1 binder (example from https://github.com/martinpacesa/BindCraft).
-Results go to the Modal Volume `bindcraft`. Use `--detach` so the job keeps
-running after you disconnect:
+Basic PDL1 binder using the [PyRosetta-free BindCraft fork](https://github.com/nedru004/BindCraft)
+(upstream: https://github.com/martinpacesa/BindCraft). Skipping FastRelax
+speeds up each trajectory. Results go to the Modal Volume `bindcraft`.
+Use `--detach` so the job keeps running after you disconnect:
 
 ```bash
 wget https://raw.githubusercontent.com/martinpacesa/BindCraft/refs/heads/main/example/PDL1.pdb
 GPU=A100 uv run --with modal modal run --detach modal_bindcraft.py --input-pdb PDL1.pdb --number-of-final-designs 1
 # later: modal volume get bindcraft <run_name> ./out/bindcraft/
+
+# seed hallucination with an existing binder sequence (length comes from the seq)
+GPU=A100 uv run --with modal modal run --detach modal_bindcraft.py \
+  --input-pdb PDL1.pdb --starting-binder-seq SKEEELKKLKEEAKKKLEEALKKAKEELKKKLEE
 ```
+
+## BindCraft2
+
+[BindCraft2](https://github.com/PacesaLab/BindCraft2) (BC2) is the successor to BindCraft.
+It designs de novo miniproteins, scaffolded binders (VHH, ARP, scFv, Fab), peptides,
+and multistate campaigns from one JSON file. Results go to the Modal Volume
+`bindcraft2`. Use `--detach` so the job keeps running after you disconnect:
+
+```bash
+wget https://raw.githubusercontent.com/martinpacesa/BindCraft/refs/heads/main/example/PDL1.pdb
+GPU=A100 uv run --with modal modal run --detach modal_bindcraft2.py \
+  --input-pdb PDL1.pdb --number-of-final-designs 1
+# later: modal volume get bindcraft2 <run_name> ./out/bindcraft2/
+
+# shipped PD-L1 target (no PDB needed)
+GPU=A100 uv run --with modal modal run --detach modal_bindcraft2.py \
+  --target hPDL1 --number-of-final-designs 1
+
+# VHH against PD-L1, with humanization
+GPU=A100 uv run --with modal modal run --detach modal_bindcraft2.py \
+  --target hPDL1 --modality VHH --humanize --number-of-final-designs 1
+
+# native BC2 campaign JSON (local target_path / scaffold files are uploaded)
+GPU=A100 uv run --with modal modal run --detach modal_bindcraft2.py \
+  --input-json design.json
+```
+
+Accepted designs land in `3_Ranked/` (`!_Ranked.csv` and `*.cif`). Chain A is
+the target and remaining chains are the binder for a typical de novo run.
+Validate with Boltz or AlphaFast:
+
+```bash
+GPU=A100 uv run --with modal modal run --detach modal_boltz_validate.py \
+  --volume-name bindcraft2 --input-dir <run>/<campaign>/3_Ranked \
+  --binder-chain B --target-chains A
+```
+
+Useful flags: `--modality binder|VHH|peptide|cyclic_peptide|...`,
+`--binder-lengths 80,80` (or `60,100` for a range), `--hotspots 54,56,66-70`,
+`--max-trajectories 40`, `--core benchmark`, property flags such as
+`--humanize` / `--forced-targeting` / `--disulfide-staple`, and
+`--set-values 'key=value;key=value'` for any other BC2 setting.
+See the [BindCraft2 README](https://github.com/PacesaLab/BindCraft2) for
+modalities and presets. BindCraft (v1) remains available as `modal_bindcraft.py`.
 
 ## Boltz
 [Boltz](https://github.com/jwohlwend/boltz), an open source AlphaFold 3-like model.
@@ -157,6 +227,16 @@ GPU=A100 uv run --with modal modal run --detach modal_boltz_validate.py \
   --volume-name bindcraft --input-dir <run>/<target>/Accepted \
   --binder-chain B --target-chains A
 
+# BindCraft2 ranked complexes (CIF; A = target, B = binder)
+GPU=A100 uv run --with modal modal run --detach modal_boltz_validate.py \
+  --volume-name bindcraft2 --input-dir <run>/<campaign>/3_Ranked \
+  --binder-chain B --target-chains A
+
+# RFD3 + SolubleMPNN (binder A; motif RMSD from each design's diffused_index_map)
+GPU=A100 uv run --with modal modal run --detach modal_boltz_validate.py \
+  --volume-name rfd3 --input-dir <run>/mpnn --recursive \
+  --binder-chain A --target-chains B,C
+
 # Local folder of complex structures
 GPU=A100 uv run --with modal modal run modal_boltz_validate.py \
   --input-dir ./designs --binder-chain B --target-chains A --no-msa
@@ -166,9 +246,17 @@ GPU=A100 uv run --with modal modal run modal_boltz_validate.py \
 
 Useful flags: `--no-msa` (single-sequence, faster), `--no-monomer`,
 `--recycling-steps 10 --diffusion-samples 5` (more accurate, slower),
-`--use-potentials`, `--target-pdb` when designs are binder-only.
-A volume other than `bindcraft` / `proteinhunter` needs
-`DESIGN_VOLUME=<name>` so Modal can mount it.
+`--use-potentials`, `--target-pdb` when designs are binder-only,
+`--motif-residues A4,A6,A18` or `--motif-json` to override auto motif
+lookup. ipSAE ([PyPI](https://pypi.org/project/ipsae/)) is scored on each
+Boltz complex (defaults `--ipsae-pae-cutoff 10 --ipsae-dist-cutoff 10`) and
+preferred in ranking when available. A volume other than `bindcraft` /
+`bindcraft2` / `proteinhunter` / `rfd3` needs `DESIGN_VOLUME=<name>` so Modal
+can mount it.
+
+For motif scaffolding, `rankings.csv` also includes `rmsd_motif` (Kabsch
+on motif CAs) and `rmsd_motif_on_target` (same atoms after aligning the
+target). Pass `--binder-chain A` for RFD3; BindCraft defaults stay B/A.
 
 ## BoltzGen
 [BoltzGen](https://github.com/HannesStark/boltzgen), generative model for biomolecular structures.
@@ -212,10 +300,15 @@ uv run --with modal modal run modal_esm2_predict_masked.py --input-faa test_esm2
 [ESMFold2](https://github.com/Biohub/esm) (Biohub) — single-sequence / complex
 structure prediction. No MSA required (PLM-only). Multi-entity FASTA: header
 type tags `protein|`, `dna|`, `rna|`, `ligand|` (SMILES for ligand) are honored.
+Use `--model ESMFold2` (default) or `--model ESMFold2-Fast`. Weights are cached
+on the Modal Volume `esmfold2-models` (shared with binder design).
 
 ```bash
 printf '>protein|name=insulin\nGIVEQCCTSICSLYQLENYCN\n' > test_esmfold2.faa
 uv run --with modal modal run modal_esmfold2.py --input-faa test_esmfold2.faa
+
+# Inference-optimized Fast variant
+uv run --with modal modal run modal_esmfold2.py --input-faa test_esmfold2.faa --model ESMFold2-Fast
 ```
 
 ## ESMFold2 binder design
@@ -364,10 +457,18 @@ GPU=A100 uv run --with modal modal run --detach modal_proteinhunter.py \
   --seq GPDRERARELARILLKVIKLSDSPEARRQLLRNLEELAEKYKDPEVRRILEEAERYIK \
   --fixed-positions 12,15,20-24 --num-designs 1
 
-# Motif scaffold: letters stay fixed, X is redesigned
+# Graft a motif into a de novo binder (MPNN will not redesign those sites)
 GPU=A100 uv run --with modal modal run --detach modal_proteinhunter.py \
   --protein-seqs AFTVTVPKDLYVVEYGSNMTIECKFPVEKQLDLAALIVYWEMEDKNIIQFVHGEEDLKVQHSSYRQRARLLKDQLSLGNAALQITDVKLQDAGVYRCMISYGGADYKRITVKVNAPYAAALE \
-  --seq XXXXXXXXXXXWXXYXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX --num-designs 1
+  --motif RGD --fixed-positions 45-47 --num-designs 1
+
+# Keep fixed binder residues (or atoms) in contact with the target (Boltz force=true).
+# Protein Hunter chains: A = binder, B/C = target. Shorthand 12:45 means A12-B45.
+# Optional atoms: A12.OG:B45.NE2 or ligand A12:C.C20
+GPU=A100 uv run --with modal modal run --detach modal_proteinhunter.py \
+  --protein-seqs AFTVTVPKDLYVVEYGSNMTIECKFPVEKQLDLAALIVYWEMEDKNIIQFVHGEEDLKVQHSSYRQRARLLKDQLSLGNAALQITDVKLQDAGVYRCMISYGGADYKRITVKVNAPYAAALE \
+  --seq GPDRERARELARILLKVIKLSDSPEARRQLLRNLEELAEKYKDPEVRRILEEAERYIK \
+  --fixed-positions 12,15 --force-contacts A12.OG:B45.NE2,A15:B48 --num-designs 1
 
 # Refine designed complexes in a folder (A = target, B = binder)
 GPU=A100 uv run --with modal modal run --detach modal_proteinhunter.py \
@@ -383,7 +484,13 @@ server), `--percent-x 100`, `--cyclic` for peptide binders, `--ligand-ccd SAM`
 for small-molecule targets, `--template-path local.cif` (uploaded automatically;
 repeat once per target when using `--template-cif-chain-id B,C`),
 `--seq` plus `--fixed-positions 12,15,20-24` to redesign a binder while
-keeping important residues (or put `X` in `--seq` for positions to redesign).
+keeping important residues, or `--motif RGD --fixed-positions 45-47` to
+graft a motif into a de novo design. Pair a locked motif with
+`--force-contacts A12:B45,A15:B48` (or shorthand `12:45`) to keep those
+binder residues against specific target residues. Add atom names when you
+need a specific contact (`A12.OG:B45.NE2`, or ligand `A12:C.C20`). Boltz
+`force` is on and `--force-contact-distance` (default 6 Å) applies to every
+pair.
 Folder refine (`--input-dir`) extracts the binder sequence from `--binder-chain`
 (default `B`, BindCraft-style; BoltzGen often uses `A`) and writes into
 `<input-dir>/proteinhunter/` (`--out-subdir` to rename). Binder-only PDBs need
@@ -398,6 +505,83 @@ MSA. Needs ~20–25 GB VRAM; ~7–10 min per design on an H100.
 printf '>protein|A\nMAWTPLLLLLLSHCTGSLSQPVLTQPTSLSASPGASARFTCTLRSGINVGTYRIYWYQQKPGSLPRYLLRYKSDSDKQQGSGVPSRFSGSKDASTNAGLLLISGLQSEDEADYYCAIWYSSTS\n' > test_protenix.faa
 uv run --with modal modal run modal_protenix.py --input-faa test_protenix.faa --seeds 42 --no-use-msa
 ```
+
+## RFdiffusion3
+
+[RFdiffusion3](https://github.com/RosettaCommons/foundry/tree/production/models/rfd3)
+(all-atom diffusion) designs protein binders and motif-scaffolded backbones.
+You write a local YAML (or JSON) spec; any PDB/CIF in an `input:` field is
+uploaded automatically (paths are relative to the YAML file). Weights live on
+the Modal Volume `rfd3-weights`; designs go to Volume `rfd3`.
+
+Input fields are documented
+[here](https://github.com/RosettaCommons/foundry/blob/production/models/rfd3/docs/input.md).
+RFD3 convention is designed binder as chain A, target as chain B.
+
+Download the ~3 GB checkpoint once (or upload a copy you already have):
+
+```bash
+uv run --with modal modal run modal_rfd3.py --install-weights
+
+# or, if you already ran `foundry install rfd3 --checkpoint-dir ...` locally:
+uv run --with modal modal run modal_rfd3.py \
+  --upload-weights /path/to/checkpoints/rfd3_latest.ckpt
+```
+
+Put the YAML next to the motif structure. Relative `input:` paths are
+resolved from the YAML file's directory (absolute paths also work and are
+rewritten before upload):
+
+```bash
+# Example: de novo binder against a cropped target PDB (hotspots + contig).
+# Put pdl1_cropped.pdb in the same directory as this YAML.
+cat > pdl1.yaml << 'EOF'
+pdl1_binder:
+    input: pdl1_cropped.pdb
+    contig: 55-88,/0,B1-114
+    select_hotspots: B37,B39,B51,B52,B98,B100
+    infer_ori_strategy: hotspots
+    redesign_motif_sidechains: false
+    is_non_loopy: true
+EOF
+
+GPU=A100 uv run --with modal modal run --detach modal_rfd3.py \
+  --input-yaml pdl1.yaml --n-batches 1 --diffusion-batch-size 8 \
+  --num-mpnn 8
+# later: modal volume get rfd3 <run_name> ./out/rfd3/
+```
+
+After each backbone is written, SolubleMPNN
+(`solublempnn_v_48_020.pt`) designs sequences for the diffused residues.
+Fixed positions are the **values** of `diffused_index_map` in that design's
+JSON (output numbering): motif residues from `unindex`/`contig` plus the
+target chains. Pass `--num-mpnn N` (default 8) or `--no-mpnn` to skip.
+Sequences and redesigned CIFs land in `<run>/mpnn/` on the volume.
+
+Validate those MPNN complexes with Boltz or AlphaFast (RFD3 uses binder
+chain A, not BindCraft's B). Motif RMSD is computed automatically from
+each design's `diffused_index_map` (fixed residues on the binder):
+
+```bash
+GPU=A100 uv run --with modal modal run --detach modal_boltz_validate.py \
+  --volume-name rfd3 --input-dir <run>/mpnn --recursive \
+  --binder-chain A --target-chains B,C
+
+GPU=A100-80GB uv run --with modal modal run --detach modal_alphafast_validate.py \
+  --volume-name rfd3 --input-dir <run>/mpnn --recursive \
+  --binder-chain A --target-chains B,C
+```
+
+Motif scaffolding is the same pattern: point `input:` at the motif PDB/CIF
+and describe it in `contig` / `unindex`. Multiple specs in one YAML each get
+their own `input:` file, and all of them are packed into the job.
+
+Useful flags: `--diffusion-batch-size 8` (designs per batch), `--n-batches 1`
+(more batches → more length diversity), `--num-mpnn 8` (SolubleMPNN
+sequences per backbone), `--no-mpnn`, `--dump-trajectories`,
+`--low-memory-mode`, `--extra-args "inference_sampler.num_timesteps=50"`.
+Total backbones per spec ≈ `n_batches * diffusion_batch_size`. Needs a GPU with
+enough VRAM for the target size; start with `GPU=A100` for binders.
 
 ## RSO (binder design)
 

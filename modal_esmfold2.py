@@ -9,7 +9,12 @@
 https://github.com/Biohub/esm  https://huggingface.co/biohub/ESMFold2
 
 Single-sequence (or multi-chain complex) folding with the Biohub ESMFold2
-model. No API token required; weights are baked into the image at build time.
+model. No API token required. Weights live on the Modal Volume
+`esmfold2-models` (shared with the binder-design app) so HF downloads happen
+once and persist across runs / image rebuilds.
+
+Use `--model ESMFold2` (default) or `--model ESMFold2-Fast` for the
+inference-optimized single-sequence variant.
 
 Input is a FASTA. Header type tags `protein|`, `dna|`, `rna|`, `ligand|`
 are honored when present; otherwise sequences are treated as protein.
@@ -18,6 +23,9 @@ Ligand sequences are interpreted as SMILES.
 ```
 printf '>protein|name=insulin\\nGIVEQCCTSICSLYQLENYCN\\n' > test_esmfold2.faa
 modal run modal_esmfold2.py --input-faa test_esmfold2.faa
+
+# Fast variant
+modal run modal_esmfold2.py --input-faa test_esmfold2.faa --model ESMFold2-Fast
 
 # Multi-entity complex with a ligand
 printf '>protein|A\\nMKTAYIAKQRQISFVKSHFSRQ\\n>ligand|B\\nN[C@@H](Cc1ccc(O)cc1)C(=O)O\\n' > complex.faa
@@ -28,28 +36,61 @@ modal run modal_esmfold2.py --input-faa complex.faa --num-diffusion-samples 3
 import os
 from pathlib import Path
 
-from modal import App, Image
+from modal import App, Image, Volume
 
-GPU = os.environ.get("MODAL_GPU", "A100-40GB")
+GPU = os.environ.get("GPU", "A100-40GB")
 TIMEOUT = int(os.environ.get("MODAL_TIMEOUT", 30))
 
-ESMFOLD2_HF_REPO = "biohub/ESMFold2"
-ESMFOLD2_HF_REVISION = "1afea82e432079d9af2ebd71d1e4c339ecca2ff0"
+# Short name -> (HF repo_id, optional pinned revision). Same ESMFold2Model API.
+ESMFOLD2_MODELS: dict[str, tuple[str, str | None]] = {
+    "ESMFold2": ("biohub/ESMFold2", "1afea82e432079d9af2ebd71d1e4c339ecca2ff0"),
+    "ESMFold2-Fast": ("biohub/ESMFold2-Fast", None),
+}
+DEFAULT_MODEL = "ESMFold2"
+# LM backbone loaded by ESMFold2Model; separate HF repo from the fold trunk.
+ESMC_HF_REPO = "biohub/ESMC-6B"
 ESMFOLD2_GIT_REF = "c94ed8d"
-ESMFOLD2_CACHE_DIR = "/root/.cache/huggingface"
+
+# Shared with modal_esmfold2_binder_design.py so both apps reuse one HF cache.
+MODELS_VOLUME_NAME = "esmfold2-models"
+MODELS_VOLUME = Volume.from_name(MODELS_VOLUME_NAME, create_if_missing=True)
+MODELS_DIR = "/models"
+
+
+def _resolve_model(model: str) -> tuple[str, str, str | None]:
+    """Map CLI model name or HF repo id to (short_name, repo_id, revision)."""
+    if model in ESMFOLD2_MODELS:
+        repo_id, revision = ESMFOLD2_MODELS[model]
+        return model, repo_id, revision
+    for name, (repo_id, revision) in ESMFOLD2_MODELS.items():
+        if model == repo_id:
+            return name, repo_id, revision
+    choices = ", ".join(ESMFOLD2_MODELS)
+    raise ValueError(f"Unknown model {model!r}; choose one of: {choices}")
+
+
+def _snapshot(repo_id: str, revision: str | None = None) -> None:
+    from huggingface_hub import snapshot_download
+
+    kwargs: dict = {
+        "repo_id": repo_id,
+        "allow_patterns": [
+            "*.safetensors", "*.bin", "*.json", "*.pkl", "*.txt", "*.model",
+        ],
+    }
+    if revision is not None:
+        kwargs["revision"] = revision
+    print(f"[download] {repo_id}" + (f"@{revision}" if revision else ""))
+    snapshot_download(**kwargs)
 
 
 def _download_models():
-    """Pre-download ESMFold2 weights into the image cache at build time."""
-    from huggingface_hub import snapshot_download
-
-    Path(ESMFOLD2_CACHE_DIR).mkdir(parents=True, exist_ok=True)
-    snapshot_download(
-        repo_id=ESMFOLD2_HF_REPO,
-        revision=ESMFOLD2_HF_REVISION,
-        cache_dir=ESMFOLD2_CACHE_DIR,
-        allow_patterns=["*.safetensors", "*.bin", "*.json", "*.pkl", "*.txt", "*.model"],
-    )
+    """Pre-download fold trunks + ESMC backbone into the shared models Volume."""
+    Path(MODELS_DIR).mkdir(parents=True, exist_ok=True)
+    for repo_id, revision in ESMFOLD2_MODELS.values():
+        _snapshot(repo_id, revision)
+    _snapshot(ESMC_HF_REPO)
+    MODELS_VOLUME.commit()
 
 
 image = (
@@ -57,15 +98,19 @@ image = (
     .apt_install("git", "wget")
     .env({
         "CUDA_HOME": "/usr/local/cuda",
-        "HF_HOME": ESMFOLD2_CACHE_DIR,
-        "HF_HUB_CACHE": ESMFOLD2_CACHE_DIR,
+        # Match binder_design: HF_HOME=/models so both apps share hub cache layout.
+        "HF_HOME": MODELS_DIR,
+        "HF_XET_HIGH_PERFORMANCE": "1",
     })
     .uv_pip_install(
         f"esm @ git+https://github.com/Biohub/esm.git@{ESMFOLD2_GIT_REF}",
         "xformers",
         "huggingface_hub",
     )
-    .run_function(_download_models)
+    .run_function(
+        _download_models,
+        volumes={MODELS_DIR: MODELS_VOLUME},
+    )
 )
 
 app = App("esmfold2", image=image)
@@ -115,7 +160,11 @@ def _fasta_to_input(fasta_str: str):
     return StructurePredictionInput(sequences=sequences)
 
 
-@app.function(timeout=TIMEOUT * 60, gpu=GPU)
+@app.function(
+    timeout=TIMEOUT * 60,
+    gpu=GPU,
+    volumes={MODELS_DIR: MODELS_VOLUME},
+)
 def esmfold2(
     fasta_name: str,
     fasta_str: str,
@@ -123,6 +172,7 @@ def esmfold2(
     num_diffusion_samples: int = 1,
     num_sampling_steps: int = 50,
     num_loops: int = 3,
+    model_name: str = DEFAULT_MODEL,
 ) -> list[tuple[Path, bytes]]:
     """Fold a FASTA with ESMFold2; return per-sample CIF + scores JSON."""
     import json
@@ -131,13 +181,14 @@ def esmfold2(
     from esm.models.esmfold2 import ESMFold2InputBuilder
     from transformers.models.esmfold2.modeling_esmfold2 import ESMFold2Model
 
+    short_name, repo_id, revision = _resolve_model(model_name)
+    load_kwargs: dict = {"local_files_only": True}
+    if revision is not None:
+        load_kwargs["revision"] = revision
+
     t0 = time.time()
-    model = ESMFold2Model.from_pretrained(
-        ESMFOLD2_HF_REPO,
-        revision=ESMFOLD2_HF_REVISION,
-        local_files_only=True,
-    ).cuda().eval()
-    print(f"[esmfold2] Model loaded in {time.time() - t0:.1f}s")
+    model = ESMFold2Model.from_pretrained(repo_id, **load_kwargs).cuda().eval()
+    print(f"[esmfold2] {short_name} ({repo_id}) loaded in {time.time() - t0:.1f}s")
 
     spi = _fasta_to_input(fasta_str)
     print(f"[esmfold2] {len(spi.sequences)} entities, samples={num_diffusion_samples}, steps={num_sampling_steps}")
@@ -191,6 +242,7 @@ def esmfold2(
 @app.local_entrypoint()
 def main(
     input_faa: str,
+    model: str = DEFAULT_MODEL,
     seed: int = 42,
     num_diffusion_samples: int = 1,
     num_sampling_steps: int = 50,
@@ -200,6 +252,7 @@ def main(
 ):
     from datetime import datetime
 
+    _resolve_model(model)  # fail fast on bad --model before spinning up GPU
     fasta_str = Path(input_faa).read_text()
     fasta_name = Path(input_faa).stem
 
@@ -210,6 +263,7 @@ def main(
         num_diffusion_samples=num_diffusion_samples,
         num_sampling_steps=num_sampling_steps,
         num_loops=num_loops,
+        model_name=model,
     )
 
     today = datetime.now().strftime("%Y%m%d%H%M")[2:]

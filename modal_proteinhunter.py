@@ -12,8 +12,8 @@ Paper: https://www.biorxiv.org/content/10.1101/2025.10.10.681530
 
 Designs de novo protein binders with Boltz-2 hallucination + LigandMPNN
 sequence design. AlphaFold3 cross-validation is not included. The fork
-adds LigandMPNN --fixed_residues so important binder amino acids can
-be locked while the rest are redesigned.
+locks binder residues during MPNN via --fixed_positions (and optional
+--motif amino acids to graft at those sites).
 
 Results are written to the Modal Volume named "proteinhunter". Create it
 once, then always use --detach so you can close the terminal:
@@ -28,16 +28,24 @@ once, then always use --detach so you can close the terminal:
     GPU=A100 uv run --with modal modal run --detach modal_proteinhunter.py \\
       --input-pdb PDL1.pdb --target-chains A --num-designs 1
 
-    # redesign an existing binder, keeping selected residues:
+    # redesign an existing binder, keeping selected residues (AAs from --seq):
     GPU=A100 uv run --with modal modal run --detach modal_proteinhunter.py \\
       --protein-seqs AFTVTVPKDLYVVEYGSNMTIECKFPVEKQLDLAALIVYWEMEDKNIIQFVHGEEDLKVQHSSYRQRARLLKDQLSLGNAALQITDVKLQDAGVYRCMISYGGADYKRITVKVNAPYAAALE \\
       --seq GPDRERARELARILLKVIKLSDSPEARRQLLRNLEELAEKYKDPEVRRILEEAERYIK \\
       --fixed-positions 12,15,20-24 --num-designs 1
 
-    # motif scaffold: letters stay fixed, X is redesigned:
+    # graft a motif into a de novo binder (MPNN will not redesign those sites):
     GPU=A100 uv run --with modal modal run --detach modal_proteinhunter.py \\
       --protein-seqs AFTVTVPKDLYVVEYGSNMTIECKFPVEKQLDLAALIVYWEMEDKNIIQFVHGEEDLKVQHSSYRQRARLLKDQLSLGNAALQITDVKLQDAGVYRCMISYGGADYKRITVKVNAPYAAALE \\
-      --seq XXXXXXXXXXXWXXYXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX --num-designs 1
+      --motif RGD --fixed-positions 45-47 --num-designs 1
+
+    # keep fixed binder residues (or atoms) in contact with the target (Boltz force=true):
+    # Protein Hunter chains: A = binder, B/C = target. Shorthand 12:45 means A12-B45.
+    # Optional atoms: A12.OG:B45.NE2, A12OG:B45NE2, or ligand A12:C.C20
+    GPU=A100 uv run --with modal modal run --detach modal_proteinhunter.py \\
+      --protein-seqs AFTVTVPKDLYVVEYGSNMTIECKFPVEKQLDLAALIVYWEMEDKNIIQFVHGEEDLKVQHSSYRQRARLLKDQLSLGNAALQITDVKLQDAGVYRCMISYGGADYKRITVKVNAPYAAALE \\
+      --seq GPDRERARELARILLKVIKLSDSPEARRQLLRNLEELAEKYKDPEVRRILEEAERYIK \\
+      --fixed-positions 12,15 --force-contacts A12.OG:B45.NE2,A15:B48 --num-designs 1
 
     # refine a folder of designed complexes (A = target, B = binder):
     GPU=A100 uv run --with modal modal run --detach modal_proteinhunter.py \\
@@ -77,6 +85,8 @@ VOLUME = Volume.from_name(VOLUME_NAME)
 VOLUME_MOUNT = f"/{VOLUME_NAME}"
 
 PH_ROOT = "/root/Protein-Hunter"
+# Pin so Modal rebuilds the image after the fork's fixed-position changes.
+PH_COMMIT = "0ffe83296b3a70bd43ed17bc749b401223a1e679"
 
 AA3TO1 = {
     "ALA": "A",
@@ -122,6 +132,7 @@ image = (
     .apt_install("git", "wget", "gcc", "g++", "build-essential")
     .run_commands(
         f"git clone https://github.com/nedru004/Protein-Hunter.git {PH_ROOT}"
+        f" && cd {PH_ROOT} && git checkout {PH_COMMIT}"
     )
     # CUDA torch first so boltz_ph does not pull a CPU wheel
     .run_commands(
@@ -164,73 +175,90 @@ def _chain_ids(chains: str) -> list[str]:
     return [c for c in chains.replace(" ", "") if c]
 
 
-# LigandMPNN --fixed_residues tokens: chain letter + 1-indexed PDB residue number.
-_FIXED_POS_TOKEN = re.compile(
-    r"^(?:(?P<chain>[A-Za-z])\s*)?(?P<start>\d+)"
-    r"(?:\s*-\s*(?:(?P<end_chain>[A-Za-z])\s*)?(?P<end>\d+))?$"
+# Boltz contact pairs: CHAIN?RES(.ATOM)? : CHAIN?RES(.ATOM)?  (A = binder, B = first target).
+_FORCE_CONTACT_ATOM = r"[A-Za-z][A-Za-z0-9']*"
+_FORCE_CONTACT_SIDE = (
+    r"(?:(?P<c{n}>[A-Za-z]+))?"
+    r"(?:"
+    r"(?P<r{n}>\d+)(?:[./](?P<a{n}>[A-Za-z0-9']+)|(?P<g{n}>" + _FORCE_CONTACT_ATOM + r"))?"
+    r"|"
+    r"[./](?P<l{n}>[A-Za-z0-9']+)"
+    r")"
+)
+_FORCE_CONTACT_TOKEN = re.compile(
+    _FORCE_CONTACT_SIDE.format(n=1) + r"\s*[:=\-]\s*" + _FORCE_CONTACT_SIDE.format(n=2)
+)
+FORCE_CONTACT_DISTANCE_DEFAULT = 6.0
+_FORCE_CONTACT_HELP = (
+    "Use binder:target pairs such as A12:B45, A12.OG:B45.NE2, or A12:C.C20 "
+    "(A = binder, B = first target; optional atoms after . or /)."
 )
 
 
-def parse_fixed_positions(spec: str, chain: str = "A") -> str:
-    """Convert residue specs to LigandMPNN `--fixed_residues` format.
+def _force_contact_yaml_token(token: list) -> list:
+    """Boltz contact YAML is two fields: [chain, res] or [chain, atom]."""
+    if len(token) == 3:
+        return [token[0], token[1]]
+    return list(token)
 
-    Binder chain is Protein Hunter chain A. Residue numbers are 1-indexed.
-    Accepts ``1,5,12``, ``1-4,10``, ``A1 A5 A12``, or ``A1,A5,B12``.
+
+def _format_force_contact_token(token: list) -> str:
+    if len(token) == 3:
+        return f"{token[0]}{token[1]}.{token[2]}"
+    if isinstance(token[1], str):
+        return f"{token[0]}.{token[1]}"
+    return f"{token[0]}{token[1]}"
+
+
+def _force_contact_side_token(match: re.Match, n: int, default_chain: str) -> list:
+    """Build one Boltz token: [chain, res], [chain, res, atom], or [chain, atom]."""
+    chain = (match.group(f"c{n}") or default_chain).upper()
+    res_raw = match.group(f"r{n}")
+    atom = match.group(f"a{n}") or match.group(f"g{n}") or match.group(f"l{n}")
+    atom = atom.upper() if atom else None
+    if res_raw is None:
+        if not atom:
+            raise ValueError(f"Invalid --force-contacts token {match.group(0)!r}. {_FORCE_CONTACT_HELP}")
+        return [chain, atom]
+    res = int(res_raw)
+    if res < 1:
+        raise ValueError(f"Contact residues are 1-indexed: {match.group(0)!r}")
+    if atom:
+        return [chain, res, atom]
+    return [chain, res]
+
+
+def parse_force_contacts(spec: str) -> list[tuple[list, list]]:
+    """Parse residue/atom pairs into Boltz ``contact`` tokens.
+
+    Protein Hunter chain IDs: A is the designed binder, B/C/... are targets.
+    Accepts ``A12:B45``, ``A12.OG:B45.NE2``, ``A12OG:B45NE2``, ligand
+    ``A12:C.C20``, or shorthand ``12:45`` (A12 to B45). Residue numbers
+    are 1-indexed.
     """
     if not spec or not spec.strip():
-        return ""
-    tokens: list[str] = []
-    for raw in spec.replace(",", " ").split():
-        match = _FIXED_POS_TOKEN.match(raw)
-        if not match:
+        return []
+    text = spec.strip()
+    pairs: list[tuple[list, list]] = []
+    pos = 0
+    for match in _FORCE_CONTACT_TOKEN.finditer(text):
+        gap = text[pos : match.start()].strip(" ,;")
+        if gap:
             raise ValueError(
-                f"Invalid --fixed-positions token {raw!r}. "
-                "Use 1-indexed numbers (12,15,20-24) or LigandMPNN "
-                "tokens (A12 A15 A20)."
+                f"Invalid --force-contacts token {gap!r}. {_FORCE_CONTACT_HELP}"
             )
-        start_chain = (match.group("chain") or chain).upper()
-        start = int(match.group("start"))
-        if match.group("end"):
-            end_chain = (match.group("end_chain") or start_chain).upper()
-            if end_chain != start_chain:
-                raise ValueError(
-                    f"Range {raw!r} spans chains {start_chain} and {end_chain}"
-                )
-            end = int(match.group("end"))
-            if end < start:
-                raise ValueError(f"Range {raw!r} has end before start")
-            tokens.extend(f"{start_chain}{i}" for i in range(start, end + 1))
-        else:
-            tokens.append(f"{start_chain}{start}")
-    return " ".join(tokens)
-
-
-def fixed_residues_from_motif(seq: str, chain: str = "A") -> str:
-    """Lock every non-X residue in a motif scaffold (1-indexed, binder chain A)."""
-    return " ".join(
-        f"{chain}{i}" for i, aa in enumerate(seq, start=1) if aa.upper() != "X"
-    )
-
-
-def resolve_fixed_residues(
-    seq: str = "",
-    fixed_positions: str = "",
-    chain: str = "A",
-) -> str:
-    """LigandMPNN fixed-residue string from explicit positions or a motif seq.
-
-    Explicit ``fixed_positions`` wins. Otherwise, if ``seq`` mixes letters
-    and X, non-X positions are locked. A fully specified sequence with no
-    X does not auto-lock anything (that would freeze the whole binder).
-    """
-    if fixed_positions and fixed_positions.strip():
-        return parse_fixed_positions(fixed_positions, chain)
-    if not seq:
-        return ""
-    letters = [aa for aa in seq if aa.upper() != "X"]
-    if letters and len(letters) < len(seq):
-        return fixed_residues_from_motif(seq, chain)
-    return ""
+        token1 = _force_contact_side_token(match, 1, "A")
+        token2 = _force_contact_side_token(match, 2, "B")
+        pairs.append((token1, token2))
+        pos = match.end()
+    gap = text[pos:].strip(" ,;")
+    if gap:
+        raise ValueError(
+            f"Invalid --force-contacts token {gap!r}. {_FORCE_CONTACT_HELP}"
+        )
+    if not pairs:
+        raise ValueError(f"Invalid --force-contacts token {text!r}. {_FORCE_CONTACT_HELP}")
+    return pairs
 
 
 def pdb_chains_to_seqs(pdb_str: str, chains: str, filename: str = "input.pdb") -> str:
@@ -547,7 +575,87 @@ def _collect_refine_jobs(
                 "    WARNING: binder is longer than target; "
                 "check --binder-chain (BoltzGen often uses A)"
             )
+        if (
+            tgt_label
+            and tgt_label != "override"
+            and not tgt_label.endswith((".pdb", ".cif", ".mmcif"))
+        ):
+            matching = [
+                label
+                for label, s in zip(tgt_label.split(","), target_seq.split(":"))
+                if s == binder_seq
+            ]
+            if matching:
+                print(
+                    f"    WARNING: binder sequence equals target chain(s) "
+                    f"{', '.join(matching)}. Boltz requires a shared MSA; "
+                    f"consider --target-chains without those IDs if they "
+                    f"are not true targets (e.g. binder homodimer copies)."
+                )
     return jobs
+
+
+def _sync_duplicate_seq_msas(data: dict) -> None:
+    """Boltz requires identical protein sequences to share the same MSA path.
+
+    Protein Hunter starts the binder as sequence 'X' with msa='empty', then
+    swaps in --seq. If that sequence already exists on a target chain with a
+    real MSA, leave the binder on 'empty' and Boltz raises:
+    'All proteins with the same sequence must share the same MSA!'
+    """
+    proteins = [
+        entry["protein"]
+        for entry in data.get("sequences", [])
+        if isinstance(entry, dict) and "protein" in entry
+    ]
+    seq_to_msa: dict[str, str] = {}
+
+    def _msa_rank(m: str) -> int:
+        if not m or m in ("empty", "mmseqs"):
+            return 0
+        return 1  # concrete path / file
+
+    for prot in proteins:
+        seq = prot.get("sequence") or ""
+        if not seq or seq == "X":
+            continue
+        msa = prot.get("msa", "empty")
+        prev = seq_to_msa.get(seq)
+        if prev is None or _msa_rank(msa) > _msa_rank(prev):
+            seq_to_msa[seq] = msa
+
+    for prot in proteins:
+        seq = prot.get("sequence") or ""
+        if seq not in seq_to_msa:
+            continue
+        want = seq_to_msa[seq]
+        if prot.get("msa") != want:
+            print(
+                f"Syncing MSA for chain {prot.get('id')} "
+                f"(duplicate sequence) → {want!r}"
+            )
+            prot["msa"] = want
+
+
+def _patch_binder_msa_sync() -> None:
+    """Ensure binder/target duplicate sequences share an MSA before predict."""
+    import model_utils
+
+    orig = model_utils.run_prediction
+
+    def run_prediction_synced(data, *args, **kwargs):
+        if isinstance(data, dict):
+            _sync_duplicate_seq_msas(data)
+        return orig(data, *args, **kwargs)
+
+    model_utils.run_prediction = run_prediction_synced
+    try:
+        import pipeline as pipeline_mod
+
+        pipeline_mod.run_prediction = run_prediction_synced
+    except Exception:
+        pass
+    print("Patched run_prediction to sync MSAs for duplicate sequences")
 
 
 def _download_volume_dir(run_subdir: str, dest: Path) -> bool:
@@ -842,27 +950,236 @@ def _patch_colabfold_msa() -> None:
     )
 
 
-def _patch_fixed_residues(fixed_residues: str) -> None:
-    """Inject LigandMPNN --fixed_residues into every design_sequence call.
+def _decode_atom_name(raw) -> str:
+    """Normalize Boltz atom-name storage (str, bytes, or 4-int code)."""
+    if isinstance(raw, bytes):
+        return raw.decode("ascii", "ignore").strip()
+    if isinstance(raw, str):
+        return raw.strip()
+    try:
+        if hasattr(raw, "tolist"):
+            raw = raw.tolist()
+        if isinstance(raw, (list, tuple)):
+            return "".join(chr(int(c) + 32) for c in raw if int(c) > 0).strip()
+    except (TypeError, ValueError):
+        pass
+    return str(raw).strip()
 
-    The nedru004 fork accepts fixed_positions on the wrapper, but the CLI
-    pipeline does not pass it through yet.
+
+def _residue_atom_span(token, atom_name, data) -> tuple[int, int]:
+    """Atom index range for a contact token, optionally restricted to one name."""
+    start = int(token["atom_idx"])
+    end = start + int(token["atom_num"])
+    if not atom_name:
+        return start, end
+    want = atom_name.strip().upper()
+    atoms = data.structure.atoms
+    found: list[str] = []
+    for i in range(start, end):
+        name = _decode_atom_name(atoms[i]["name"])
+        found.append(name)
+        if name.upper() == want:
+            return i, i + 1
+    names = ", ".join(found) or "none"
+    raise ValueError(
+        f"Atom {atom_name!r} not in residue (found: {names}). "
+        "Use CCD/PDB names such as CA, OG, NE2; the amino acid must have that atom."
+    )
+
+
+def _patch_force_contacts(
+    pairs: list[tuple[list, list]],
+    max_distance: float,
+) -> None:
+    """Inject Boltz forced residue/atom-pair contacts into Protein Hunter.
+
+    Protein Hunter only builds pocket constraints from --contact_residues.
+    This adds ``contact`` constraints with force=true, turns on steering
+    potentials, and applies them on every design cycle. Named polymer atoms
+    are enforced by restricting the force potential to those atoms.
     """
-    if not fixed_residues:
+    if not pairs:
         return
 
     import model_utils
     import pipeline as pipeline_mod
+    import torch
+    from boltz.data import const as boltz_const
+    from boltz.data.feature import featurizerv2
 
-    orig = model_utils.design_sequence
+    orig_build = pipeline_mod.InputDataBuilder._build_conditional_data
+    yaml_pairs = [
+        (_force_contact_yaml_token(t1), _force_contact_yaml_token(t2))
+        for t1, t2 in pairs
+    ]
+    atom_pairs = [
+        (t1[2] if len(t1) == 3 else None, t2[2] if len(t2) == 3 else None)
+        for t1, t2 in pairs
+    ]
+    nonpolymer = boltz_const.chain_type_ids["NONPOLYMER"]
 
-    def design_sequence_fixed(*args, **kwargs):
-        kwargs.setdefault("fixed_residues", fixed_residues)
-        return orig(*args, **kwargs)
+    def _token_matches(token, spec) -> bool:
+        if token["mol_type"] == nonpolymer:
+            return (token["asym_id"], token["atom_idx"]) == spec
+        return (token["asym_id"], token["res_idx"]) == spec
 
-    model_utils.design_sequence = design_sequence_fixed
-    pipeline_mod.design_sequence = design_sequence_fixed
-    print(f"LigandMPNN fixed residues: {fixed_residues}")
+    def _build_conditional_data(self):
+        data, _pocket = orig_build(self)
+        constraints = list(data.get("constraints") or [])
+        for token1, token2 in yaml_pairs:
+            constraints.append(
+                {
+                    "contact": {
+                        "token1": token1,
+                        "token2": token2,
+                        "max_distance": max_distance,
+                        "force": True,
+                    }
+                }
+            )
+        data["constraints"] = constraints
+        pretty = ", ".join(
+            f"{_format_force_contact_token(a)}:{_format_force_contact_token(b)}"
+            for a, b in pairs
+        )
+        print(
+            f"Boltz forced contacts (max_distance={max_distance} Å, force=true): {pretty}"
+        )
+        return data, True
+
+    pipeline_mod.InputDataBuilder._build_conditional_data = _build_conditional_data
+
+    if any(a or b for a, b in atom_pairs):
+        orig_pcc = featurizerv2.process_contact_feature_constraints
+
+        def process_contact_feature_constraints(
+            data,
+            inference_pocket_constraints,
+            inference_contact_constraints,
+        ):
+            inference_pocket_constraints = inference_pocket_constraints or []
+            inference_contact_constraints = list(
+                inference_contact_constraints or []
+            )
+            n = len(atom_pairs)
+            atom_for = [(None, None)] * len(inference_contact_constraints)
+            if n and len(inference_contact_constraints) >= n:
+                atom_for[-n:] = atom_pairs
+
+            token_data = data.tokens
+            pair_index, union_index, negation_mask, thresholds = [], [], [], []
+            union_idx = 0
+
+            def _add(atom_idx_pairs, dist):
+                nonlocal union_idx
+                pair_index.append(atom_idx_pairs)
+                count = atom_idx_pairs.shape[1]
+                union_index.append(torch.full((count,), union_idx))
+                negation_mask.append(torch.ones((count,), dtype=torch.bool))
+                thresholds.append(torch.full((count,), dist))
+                union_idx += 1
+
+            for binder, contacts, dist, force in inference_pocket_constraints:
+                if not force:
+                    continue
+                binder_chain = data.structure.chains[binder]
+                for token in token_data:
+                    if (
+                        token["mol_type"] != nonpolymer
+                        and (token["asym_id"], token["res_idx"]) in contacts
+                    ) or (
+                        token["mol_type"] == nonpolymer
+                        and (token["asym_id"], token["atom_idx"]) in contacts
+                    ):
+                        _add(
+                            torch.cartesian_prod(
+                                torch.arange(
+                                    binder_chain["atom_idx"],
+                                    binder_chain["atom_idx"] + binder_chain["atom_num"],
+                                ),
+                                torch.arange(
+                                    token["atom_idx"],
+                                    token["atom_idx"] + token["atom_num"],
+                                ),
+                            ).T,
+                            dist,
+                        )
+
+            for i, (token1, token2, dist, force) in enumerate(
+                inference_contact_constraints
+            ):
+                if not force:
+                    continue
+                atom1, atom2 = atom_for[i]
+                for _token1 in token_data:
+                    if not _token_matches(_token1, token1):
+                        continue
+                    for _token2 in token_data:
+                        if not _token_matches(_token2, token2):
+                            continue
+                        s1, e1 = _residue_atom_span(_token1, atom1, data)
+                        s2, e2 = _residue_atom_span(_token2, atom2, data)
+                        _add(
+                            torch.cartesian_prod(
+                                torch.arange(s1, e1),
+                                torch.arange(s2, e2),
+                            ).T,
+                            dist,
+                        )
+                        break
+                    break
+
+            if pair_index:
+                return {
+                    "contact_pair_index": torch.cat(pair_index, dim=1),
+                    "contact_union_index": torch.cat(union_index),
+                    "contact_negation_mask": torch.cat(negation_mask),
+                    "contact_thresholds": torch.cat(thresholds),
+                }
+            return orig_pcc(
+                data, inference_pocket_constraints, inference_contact_constraints
+            )
+
+        featurizerv2.process_contact_feature_constraints = (
+            process_contact_feature_constraints
+        )
+
+    orig_gbm = model_utils.get_boltz_model
+
+    def get_boltz_model(*args, **kwargs):
+        kwargs["no_potentials"] = False
+        return orig_gbm(*args, **kwargs)
+
+    model_utils.get_boltz_model = get_boltz_model
+    pipeline_mod.get_boltz_model = get_boltz_model
+
+    orig_rp = model_utils.run_prediction
+
+    def run_prediction(*args, **kwargs):
+        kwargs["pocket_conditioning"] = True
+        return orig_rp(*args, **kwargs)
+
+    model_utils.run_prediction = run_prediction
+    pipeline_mod.run_prediction = run_prediction
+
+    orig_cycle = pipeline_mod.ProteinHunter_Boltz._run_design_cycle
+
+    class _SkipPocketLookup(dict):
+        """Skip Protein Hunter's pocket-only chain lookup when only contacts exist."""
+
+        def __contains__(self, key):
+            if key == "constraints":
+                cons = dict.get(self, "constraints")
+                if cons and "pocket" not in cons[0]:
+                    return False
+            return dict.__contains__(self, key)
+
+    def _run_design_cycle(self, data_cp, run_id, pocket_conditioning):
+        if isinstance(data_cp, dict) and not isinstance(data_cp, _SkipPocketLookup):
+            data_cp = _SkipPocketLookup(data_cp)
+        return orig_cycle(self, data_cp, run_id, True)
+
+    pipeline_mod.ProteinHunter_Boltz._run_design_cycle = _run_design_cycle
 
 
 @app.function(
@@ -898,6 +1215,9 @@ def proteinhunter(
     refiner_mode: bool = False,
     template_uploads: list[dict] | None = None,
     fixed_positions: str = "",
+    motif: str = "",
+    force_contacts: str = "",
+    force_contact_distance: float = FORCE_CONTACT_DISTANCE_DEFAULT,
 ) -> dict:
     """Run Protein Hunter binder design and persist outputs on the volume.
 
@@ -921,8 +1241,6 @@ def proteinhunter(
         nucleic_seq: Optional DNA/RNA target sequence.
         nucleic_type: "dna" or "rna".
         seq: Existing binder sequence to refine (empty = de novo).
-            Use X for positions that LigandMPNN should redesign when
-            fixed_positions is omitted.
         omit_aa: Amino acids to omit during MPNN (default cysteine).
         plot: Write per-run metric plots.
         template_path: PDB code(s) or remote path(s); upload keys rewritten below.
@@ -930,7 +1248,14 @@ def proteinhunter(
         refiner_mode: Pass --refiner_mode to Protein Hunter (existing-seq refine).
         template_uploads: Local template file contents from prepare_template_uploads.
         fixed_positions: 1-indexed binder residues to keep during MPNN
-            (e.g. "12,15,20-24" or "A12 A15 A20").
+            (e.g. "12,15,20-24" or "A12 A15 A20"). Requires --seq or --motif.
+        motif: Amino acids to graft at fixed_positions. If omitted, residues
+            are taken from seq at those positions.
+        force_contacts: Binder:target residue or atom pairs kept in contact
+            with a Boltz force potential, e.g. "A12:B45", "A12.OG:B45.NE2",
+            or ligand "A12:C.C20".
+        force_contact_distance: Max distance in Å for every forced pair
+            (Boltz default 6; supported 4-20).
 
     Returns:
         Summary with volume name, save path, and high-ipTM count.
@@ -1002,6 +1327,10 @@ def proteinhunter(
         argv += ["--contact_residues", contact_residues]
     if seq:
         argv += ["--seq", seq]
+    if fixed_positions:
+        argv += ["--fixed_positions", fixed_positions]
+    if motif:
+        argv += ["--motif", motif]
     if ligand_ccd:
         argv += ["--ligand_ccd", ligand_ccd]
     if ligand_smiles:
@@ -1026,21 +1355,16 @@ def proteinhunter(
     from pipeline import ProteinHunter_Boltz
 
     _patch_colabfold_msa()
-    args = parse_args()
-    locked = resolve_fixed_residues(seq, fixed_positions)
-    if locked:
-        if not seq:
+    _patch_binder_msa_sync()
+    pairs = parse_force_contacts(force_contacts)
+    if pairs:
+        if not 4 <= force_contact_distance <= 20:
             raise ValueError(
-                "--fixed-positions requires --seq so the kept amino acids "
-                "are known (use X in --seq for positions to redesign)"
+                "--force-contact-distance must be between 4 and 20 Å "
+                f"(got {force_contact_distance})"
             )
-        for tok in locked.split():
-            resnum = int(re.search(r"\d+", tok).group())
-            if resnum < 1 or resnum > len(seq):
-                raise ValueError(
-                    f"Fixed residue {tok} is outside binder length {len(seq)}"
-                )
-        _patch_fixed_residues(locked)
+        _patch_force_contacts(pairs, force_contact_distance)
+    args = parse_args()
     print_args(args)
     Path(save_dir).mkdir(parents=True, exist_ok=True)
 
@@ -1097,6 +1421,9 @@ def _run_kwargs(
     refiner_mode: bool,
     template_uploads: list[dict] | None = None,
     fixed_positions: str = "",
+    motif: str = "",
+    force_contacts: str = "",
+    force_contact_distance: float = FORCE_CONTACT_DISTANCE_DEFAULT,
 ) -> dict:
     return dict(
         save_dir=save_dir,
@@ -1124,6 +1451,9 @@ def _run_kwargs(
         refiner_mode=refiner_mode,
         template_uploads=template_uploads,
         fixed_positions=fixed_positions,
+        motif=motif,
+        force_contacts=force_contacts,
+        force_contact_distance=force_contact_distance,
     )
 
 
@@ -1154,6 +1484,9 @@ def main(
     template_path: str = "",
     template_cif_chain_id: str = "",
     fixed_positions: str = "",
+    motif: str = "",
+    force_contacts: str = "",
+    force_contact_distance: float = FORCE_CONTACT_DISTANCE_DEFAULT,
     binder_name: str | None = None,
     run_name: str | None = None,
     out_subdir: str = OUT_SUBDIR_DEFAULT,
@@ -1191,8 +1524,6 @@ def main(
         nucleic_seq: Optional DNA/RNA sequence to bind.
         nucleic_type: "dna" or "rna". Defaults to "dna".
         seq: Optional binder sequence to refine rather than design de novo.
-            Put X at positions LigandMPNN should redesign when
-            --fixed-positions is omitted.
         omit_aa: Amino acids omitted by MPNN. Defaults to "C".
         plot: Write cycle plots. Defaults to True.
         template_path: Optional local .pdb/.cif path(s), 4-letter PDB ID, or
@@ -1202,6 +1533,15 @@ def main(
             in the same order as target chains.
         fixed_positions: 1-indexed binder residues to keep during MPNN
             (e.g. "12,15,20-24"). Binder is Protein Hunter chain A.
+            Requires --seq, --motif, or --input-dir.
+        motif: Amino acids to graft at --fixed-positions. If omitted,
+            residues are taken from --seq at those positions.
+        force_contacts: Binder:target residue or atom pairs to keep in
+            contact with a Boltz force potential. Protein Hunter chains:
+            A = binder, B/C = target. Example: "A12:B45", "A12.OG:B45.NE2",
+            or ligand "A12:C.C20". Shorthand "12:45" is A12-B45.
+        force_contact_distance: Max distance in Å applied to every pair
+            (default 6; Boltz supports 4-20).
         binder_name: Job name. Defaults to the PDB stem or "binder".
         run_name: Volume subdirectory. Defaults to a timestamp.
         out_subdir: Local results folder created inside input-dir. Defaults to proteinhunter.
@@ -1216,12 +1556,18 @@ def main(
     else:
         min_len, max_len = parts[0], parts[1]
 
-    if fixed_positions:
-        parse_fixed_positions(fixed_positions)
-        if not seq and not input_dir:
+    if motif and not fixed_positions:
+        raise SystemExit("--motif requires --fixed-positions")
+    if fixed_positions and not seq and not motif and not input_dir:
+        raise SystemExit(
+            "--fixed-positions requires --seq, --motif, or --input-dir "
+            "so the kept amino acids are known"
+        )
+    if force_contacts:
+        parse_force_contacts(force_contacts)
+        if not 4 <= force_contact_distance <= 20:
             raise SystemExit(
-                "--fixed-positions requires --seq or --input-dir so the "
-                "kept amino acids are known"
+                "--force-contact-distance must be between 4 and 20 Å"
             )
 
     today = datetime.now().strftime("%Y%m%d%H%M")[2:]
@@ -1254,6 +1600,9 @@ def main(
         template_cif_chain_id=template_cif_chain_id,
         template_uploads=template_uploads or None,
         fixed_positions=fixed_positions,
+        motif=motif,
+        force_contacts=force_contacts,
+        force_contact_distance=force_contact_distance,
     )
 
     if input_dir:

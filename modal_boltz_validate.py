@@ -18,6 +18,19 @@ From a BindCraft volume folder (chain A = target, B = binder):
       --volume-name bindcraft --input-dir <run>/<target>/Accepted \\
       --binder-chain B --target-chains A
 
+From BindCraft2 ranked complexes:
+
+    GPU=A100 uv run --with modal modal run --detach modal_boltz_validate.py \\
+      --volume-name bindcraft2 --input-dir <run>/<campaign>/3_Ranked \\
+      --binder-chain B --target-chains A
+
+From RFD3 + SolubleMPNN (binder A, target B or B,C). Motif RMSD is taken
+from each design's `diffused_index_map`:
+
+    GPU=A100 uv run --with modal modal run --detach modal_boltz_validate.py \\
+      --volume-name rfd3 --input-dir <run>/mpnn --recursive \\
+      --binder-chain A --target-chains B,C
+
 From a local folder of complex structures:
 
     GPU=A100 uv run --with modal modal run modal_boltz_validate.py \\
@@ -32,7 +45,7 @@ Download later:
 
     modal volume get boltz-validate <run_name> ./out/boltz_validate/
 
-A custom input volume that is not bindcraft/proteinhunter:
+A custom input volume that is not bindcraft/bindcraft2/proteinhunter/rfd3:
 
     DESIGN_VOLUME=my-designs GPU=A100 uv run --with modal modal run \\
       modal_boltz_validate.py --volume-name my-designs --input-dir designs/
@@ -55,7 +68,7 @@ BOLTZ_VOLUME_NAME = "boltz-models"
 BOLTZ_MODEL_VOLUME = Volume.from_name(BOLTZ_VOLUME_NAME, create_if_missing=True)
 CACHE_DIR = f"/{BOLTZ_VOLUME_NAME}"
 
-KNOWN_VOLUME_NAMES = ("bindcraft", "proteinhunter")
+KNOWN_VOLUME_NAMES = ("bindcraft", "bindcraft2", "proteinhunter", "rfd3")
 EXTRA_VOLUME_NAME = os.environ.get("DESIGN_VOLUME")
 
 OUT_VOLUME_NAME = "boltz-validate"
@@ -116,7 +129,7 @@ def download_model():
 image = (
     Image.debian_slim(python_version="3.11")
     .uv_pip_install("torch", index_url="https://download.pytorch.org/whl/cu126")
-    .uv_pip_install("boltz[cuda]==2.2.1")
+    .uv_pip_install("boltz[cuda]==2.2.1", "ipsae==1.0.1")
     .run_function(
         download_model,
         gpu="a10g",
@@ -152,14 +165,272 @@ def _chain_ids(chains: str) -> list[str]:
     return [chains.strip()]
 
 
+def _design_stem(path: Path) -> str:
+    """Stem of a structure file, stripping a trailing .gz if present."""
+    name = path.name
+    if name.lower().endswith(".gz"):
+        name = name[:-3]
+    return Path(name).stem
+
+
+def _is_structure_file(path: Path) -> bool:
+    name = path.name.lower()
+    if name.endswith(".gz"):
+        name = name[:-3]
+    return Path(name).suffix.lower() in STRUCTURE_SUFFIXES
+
+
+def _read_file_text(path: Path) -> tuple[str, str]:
+    """Return (filename_for_parser, text). Decompresses .gz CIF/PDB."""
+    import gzip
+
+    name = path.name
+    data = path.read_bytes()
+    if name.lower().endswith(".gz"):
+        data = gzip.decompress(data)
+        name = name[:-3]
+    return name, data.decode("utf-8", errors="replace")
+
+
+def _parse_res_id_list(text: str | None) -> list[str]:
+    if not text:
+        return []
+    return [p.strip() for p in text.replace(";", ",").split(",") if p.strip()]
+
+
+def _res_id_chain(token: str) -> str:
+    import re
+
+    m = re.match(r"^([A-Za-z]+)", token.strip())
+    return m.group(1) if m else ""
+
+
+def _motif_from_index_map(
+    index_map: dict, binder_chain: str, target_chains: list[str]
+) -> list[str]:
+    """Binder-chain output IDs from RFD3 ``diffused_index_map`` values."""
+    seen: set[str] = set()
+    motif: list[str] = []
+    targets = set(target_chains)
+    for out_id in (index_map or {}).values():
+        if out_id is None:
+            continue
+        token = str(out_id).strip()
+        if not token or token in seen:
+            continue
+        chain = _res_id_chain(token)
+        if binder_chain and chain != binder_chain:
+            continue
+        if chain in targets:
+            continue
+        seen.add(token)
+        motif.append(token)
+    return motif
+
+
+def _find_rfd3_json(structure: Path) -> Path | None:
+    """Locate the RFD3 metadata JSON for a design or MPNN CIF."""
+    import json
+
+    stem = _design_stem(structure)
+    stems = [stem]
+    s = stem
+    while "_" in s:
+        s = s.rsplit("_", 1)[0]
+        stems.append(s)
+    dirs: list[Path] = []
+    parent = structure.parent
+    for _ in range(4):
+        dirs.append(parent)
+        if parent.parent == parent:
+            break
+        parent = parent.parent
+    seen: set[Path] = set()
+    for d in dirs:
+        for st in stems:
+            cand = d / f"{st}.json"
+            if cand in seen or not cand.is_file():
+                continue
+            seen.add(cand)
+            try:
+                meta = json.loads(cand.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(meta, dict) and "diffused_index_map" in meta:
+                return cand
+    return None
+
+
+def _structure_for_json(json_path: Path) -> Path | None:
+    stem = json_path.with_suffix("")
+    for ext in (".cif.gz", ".cif", ".pdb"):
+        candidate = Path(str(stem) + ext)
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _resolve_existing_file(path: str | None, volume_name: str | None) -> Path | None:
+    if not path:
+        return None
+    candidates = [Path(path)]
+    if volume_name:
+        candidates.append(Path(f"/vol/{volume_name}") / path)
+    for p in candidates:
+        if p.is_file():
+            return p
+    return None
+
+
+def _motif_residues_for_design(
+    source_path: str | None,
+    binder_chain: str,
+    target_chains: list[str],
+    motif_residues: list[str],
+    motif_json: str | None,
+    volume_name: str | None = None,
+) -> list[str]:
+    import json
+
+    if motif_residues:
+        return list(motif_residues)
+    json_path = _resolve_existing_file(motif_json, volume_name)
+    if json_path is not None:
+        try:
+            meta = json.loads(json_path.read_text())
+            imap = meta.get("diffused_index_map") or {}
+            if isinstance(imap, dict):
+                return _motif_from_index_map(imap, binder_chain, target_chains)
+        except (OSError, json.JSONDecodeError):
+            pass
+    if source_path:
+        found = _find_rfd3_json(Path(source_path))
+        if found is not None:
+            try:
+                meta = json.loads(found.read_text())
+                imap = meta.get("diffused_index_map") or {}
+                if isinstance(imap, dict):
+                    ids = _motif_from_index_map(imap, binder_chain, target_chains)
+                    print(f"Motif from {found.name}: {len(ids)} residues")
+                    return ids
+            except (OSError, json.JSONDecodeError):
+                pass
+    return []
+
+
+def _attach_rfd3_sidecar(item: dict, source: Path) -> None:
+    """Pack the parent RFD3 backbone so motif indices survive a local upload."""
+    json_path = _find_rfd3_json(source)
+    if json_path is None:
+        return
+    struct = _structure_for_json(json_path)
+    if struct is None:
+        return
+    try:
+        if struct.resolve() == source.resolve():
+            return
+    except OSError:
+        return
+    try:
+        filename, content = _read_file_text(struct)
+    except OSError:
+        return
+    item["rfd3_filename"] = filename
+    item["rfd3_content"] = content
+
+
+def _indices_in_chains(
+    chains: dict[str, dict], binder: str, motif_ids: set[str]
+) -> list[int]:
+    ids = (chains.get(binder) or {}).get("res_ids") or []
+    return [i for i, rid in enumerate(ids) if rid in motif_ids]
+
+
+def _motif_indices(
+    ref_chains: dict[str, dict],
+    binder: str,
+    motif_ids: list[str],
+    source_path: str | None = None,
+    rfd3_filename: str | None = None,
+    rfd3_content: str | None = None,
+) -> list[int]:
+    ids = set(motif_ids or [])
+    if not ids:
+        return []
+    idxs = _indices_in_chains(ref_chains, binder, ids)
+    if len(idxs) >= 3:
+        return idxs
+    if rfd3_filename and rfd3_content:
+        try:
+            orig = extract_chains(rfd3_filename, rfd3_content)
+            idxs2 = _indices_in_chains(orig, binder, ids)
+            if len(idxs2) >= 3:
+                return idxs2
+        except Exception:
+            pass
+    if source_path:
+        json_path = _find_rfd3_json(Path(source_path))
+        struct = _structure_for_json(json_path) if json_path else None
+        if struct is not None:
+            try:
+                filename, content = _read_file_text(struct)
+                orig = extract_chains(filename, content)
+                idxs2 = _indices_in_chains(orig, binder, ids)
+                if len(idxs2) >= 3:
+                    return idxs2
+            except Exception:
+                pass
+    return idxs
+
+
+def _residue_id(chain_name: str, residue) -> str:
+    seqid = residue.seqid
+    num = int(seqid.num)
+    icode = (seqid.icode or "").strip()
+    return f"{chain_name}{num}{icode}"
+
+
+def _mmcif_block_with_atoms(doc):
+    """Prefer the CIF block that actually has coordinate rows."""
+    for block in doc:
+        col = block.find_loop("_atom_site.id")
+        if col is not None and col.get_loop().length() > 0:
+            return block
+    return doc.sole_block()
+
+
+def _ensure_mmcif_atom_site_defaults(block) -> None:
+    """Fill columns gemmi 0.6.x requires but many design CIFs omit.
+
+    Design tools (and some ModelCIF writers) frequently skip
+    ``_atom_site.occupancy`` and sometimes ``B_iso_or_equiv``. Without them
+    ``gemmi.make_structure_from_block`` returns a Structure with 0 models.
+    """
+    col = block.find_loop("_atom_site.id")
+    if col is None:
+        return
+    loop = col.get_loop()
+    if loop.length() == 0:
+        return
+    tags = set(loop.tags)
+    if "_atom_site.occupancy" not in tags:
+        loop.add_columns(["_atom_site.occupancy"], "1")
+    if "_atom_site.B_iso_or_equiv" not in tags:
+        loop.add_columns(["_atom_site.B_iso_or_equiv"], "50")
+
+
 def _read_structure(name: str, content: str):
     """Parse PDB or mmCIF text into a gemmi Structure."""
     import gemmi
 
     lower = name.lower()
+    if lower.endswith(".gz"):
+        lower = lower[:-3]
     if lower.endswith((".cif", ".mmcif")):
         doc = gemmi.cif.read_string(content)
-        return gemmi.make_structure_from_block(doc.sole_block())
+        block = _mmcif_block_with_atoms(doc)
+        _ensure_mmcif_atom_site_defaults(block)
+        return gemmi.make_structure_from_block(block)
     return gemmi.read_pdb_string(content)
 
 
@@ -168,13 +439,16 @@ def extract_chains(name: str, content: str) -> dict[str, dict]:
 
     Returns:
         Mapping of chain ID to dict with keys sequence (str), ca (N,3 float array),
-        plddt (N float array from B-factors).
+        plddt (N float array from B-factors), res_ids (list of e.g. A16).
     """
     import numpy as np
 
     st = _read_structure(name, content)
     if len(st) == 0:
-        raise ValueError(f"No models in {name}")
+        raise ValueError(
+            f"No models in {name} (mmCIF may be missing _atom_site rows "
+            "or required columns like occupancy)"
+        )
     try:
         st.merge_chain_parts()
     except Exception:
@@ -185,6 +459,7 @@ def extract_chains(name: str, content: str) -> dict[str, dict]:
         seq: list[str] = []
         ca: list[list[float]] = []
         plddt: list[float] = []
+        res_ids: list[str] = []
         for residue in chain:
             aa = AA3TO1.get(residue.name)
             if aa is None:
@@ -195,11 +470,13 @@ def extract_chains(name: str, content: str) -> dict[str, dict]:
             seq.append(aa)
             ca.append([atom.pos.x, atom.pos.y, atom.pos.z])
             plddt.append(float(atom.b_iso))
+            res_ids.append(_residue_id(chain.name, residue))
         if seq:
             chains[chain.name] = {
                 "sequence": "".join(seq),
                 "ca": np.asarray(ca, dtype=float),
                 "plddt": np.asarray(plddt, dtype=float),
+                "res_ids": res_ids,
             }
     if not chains:
         raise ValueError(f"No protein CA atoms in {name}")
@@ -285,11 +562,56 @@ def _match_ca(pred: dict, ref: dict):
     return pred["ca"][:n], ref["ca"][:n]
 
 
+def _motif_ca_pair(
+    pred_chains: dict[str, dict],
+    ref_chains: dict[str, dict],
+    motif_ids: set[str],
+    binder: str,
+    motif_indices: list[int] | None = None,
+):
+    """Matched motif CA coordinates in reference residue order.
+
+    Prefer residue-ID matches on the design. If the design was renumbered
+    (common for some MPNN writers), fall back to sequential binder indices
+    taken from the parent RFD3 backbone.
+    """
+    import numpy as np
+
+    ps, rs = [], []
+    if motif_ids:
+        for cid, ref in ref_chains.items():
+            if cid not in pred_chains:
+                continue
+            pred = pred_chains[cid]
+            n = min(len(pred["ca"]), len(ref["ca"]))
+            ids = ref.get("res_ids") or []
+            for i, rid in enumerate(ids):
+                if i >= n:
+                    break
+                if rid in motif_ids:
+                    ps.append(pred["ca"][i])
+                    rs.append(ref["ca"][i])
+    if len(ps) < 3 and motif_indices and binder in pred_chains and binder in ref_chains:
+        pred = pred_chains[binder]
+        ref = ref_chains[binder]
+        n = min(len(pred["ca"]), len(ref["ca"]))
+        ps, rs = [], []
+        for i in motif_indices:
+            if i < n:
+                ps.append(pred["ca"][i])
+                rs.append(ref["ca"][i])
+    if len(ps) < 3:
+        return None, None
+    return np.asarray(ps, dtype=float), np.asarray(rs, dtype=float)
+
+
 def compute_rmsds(
     pred_chains: dict[str, dict],
     ref_chains: dict[str, dict],
     binder: str,
     targets: list[str],
+    motif_res_ids: list[str] | None = None,
+    motif_indices: list[int] | None = None,
 ) -> dict[str, float | None]:
     """RMSD / TM-score of a prediction against designed coordinates."""
     import numpy as np
@@ -315,6 +637,11 @@ def compute_rmsds(
         "tm_binder_on_target": None,
         "rmsd_binder_fold": None,
         "tm_binder_fold": None,
+        "rmsd_motif": None,
+        "tm_motif": None,
+        "rmsd_motif_on_target": None,
+        "tm_motif_on_target": None,
+        "n_motif_residues": 0,
     }
     shared = [c for c in pred_chains if c in ref_chains]
     pred_all, ref_all = matched(shared)
@@ -332,14 +659,32 @@ def compute_rmsds(
             out["tm_binder_fold"] = _tm_score(aligned, rb) if aligned is not None else None
 
     pred_tgt, ref_tgt = matched([t for t in targets])
+    R_tgt, t_tgt = None, None
     if pred_tgt is not None and pb is not None:
-        R, t, _, _ = _kabsch(pred_tgt, ref_tgt)
-        if R is not None:
-            aligned_b = _apply_rt(pb, R, t)
+        R_tgt, t_tgt, _, _ = _kabsch(pred_tgt, ref_tgt)
+        if R_tgt is not None:
+            aligned_b = _apply_rt(pb, R_tgt, t_tgt)
             out["rmsd_binder_on_target"] = float(
                 np.sqrt(((aligned_b - rb) ** 2).sum(axis=1).mean())
             )
             out["tm_binder_on_target"] = _tm_score(aligned_b, rb)
+
+    motif_ids = set(motif_res_ids or [])
+    if motif_ids or motif_indices:
+        pm, rm = _motif_ca_pair(
+            pred_chains, ref_chains, motif_ids, binder, motif_indices
+        )
+        if pm is not None:
+            out["n_motif_residues"] = len(pm)
+            _, _, rmsd, aligned = _kabsch(pm, rm)
+            out["rmsd_motif"] = rmsd
+            out["tm_motif"] = _tm_score(aligned, rm) if aligned is not None else None
+            if R_tgt is not None:
+                aligned_m = _apply_rt(pm, R_tgt, t_tgt)
+                out["rmsd_motif_on_target"] = float(
+                    np.sqrt(((aligned_m - rm) ** 2).sum(axis=1).mean())
+                )
+                out["tm_motif_on_target"] = _tm_score(aligned_m, rm)
     return out
 
 
@@ -446,6 +791,108 @@ def parse_interface_pae(
     }
 
 
+def _pair_metric(nested: dict, chain_a: str, chain_b: str) -> float | None:
+    """Read nested[chain_a][chain_b], tolerating missing keys."""
+    try:
+        val = nested[chain_a][chain_b]
+    except (KeyError, TypeError):
+        return None
+    if val is None:
+        return None
+    return float(val)
+
+
+def compute_ipsae(
+    pae_path: Path,
+    structure_path: Path,
+    binder_chain: str,
+    target_chains: list[str],
+    output_dir: Path | None = None,
+    pae_cutoff: float = 10.0,
+    dist_cutoff: float = 10.0,
+) -> dict[str, float | None]:
+    """Run the PyPI ``ipsae`` package on a Boltz complex prediction.
+
+    Uses the Boltz defaults (PAE/dist cutoff 10). Reports the best
+    binder–target pair score (``ipSAE`` / d0res max), plus d0chn, d0dom,
+    pDockQ2, and LIS.
+    """
+    from ipsae import calculate_ipsae
+
+    out: dict[str, float | None] = {
+        "ipsae": None,
+        "ipsae_d0chn": None,
+        "ipsae_d0dom": None,
+        "ipsae_min": None,
+        "pdockq": None,
+        "pdockq2": None,
+        "lis": None,
+    }
+    if output_dir is None:
+        output_dir = structure_path.parent / "ipsae"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    results = calculate_ipsae(
+        pae_path,
+        structure_path,
+        pae_cutoff=pae_cutoff,
+        dist_cutoff=dist_cutoff,
+        output_dir=output_dir,
+    )
+    ipsae_scores = results.get("ipsae_scores") or {}
+    pdockq_scores = results.get("pdockq_scores") or {}
+    lis_scores = results.get("lis_scores") or {}
+
+    targets = [c for c in target_chains if c != binder_chain]
+    if not targets:
+        targets = [
+            c
+            for c in (results.get("unique_chains") or [])
+            if str(c) != binder_chain
+        ]
+        targets = [str(c) for c in targets]
+
+    ipsae_vals: list[float] = []
+    d0chn_vals: list[float] = []
+    d0dom_vals: list[float] = []
+    pdockq_vals: list[float] = []
+    pdockq2_vals: list[float] = []
+    lis_vals: list[float] = []
+
+    for t in targets:
+        for a, b in ((binder_chain, t), (t, binder_chain)):
+            for bucket, vals in (
+                (ipsae_scores.get("ipsae_d0res_max"), ipsae_vals),
+                (ipsae_scores.get("ipsae_d0chn_max"), d0chn_vals),
+                (ipsae_scores.get("ipsae_d0dom_max"), d0dom_vals),
+                (pdockq_scores.get("pDockQ"), pdockq_vals),
+                (pdockq_scores.get("pDockQ2"), pdockq2_vals),
+                (lis_scores, lis_vals),
+            ):
+                if bucket is None:
+                    continue
+                v = _pair_metric(bucket, a, b)
+                if v is not None:
+                    vals.append(v)
+
+    if ipsae_vals:
+        out["ipsae"] = max(ipsae_vals)
+        out["ipsae_min"] = min(ipsae_vals)
+    if d0chn_vals:
+        out["ipsae_d0chn"] = max(d0chn_vals)
+    if d0dom_vals:
+        out["ipsae_d0dom"] = max(d0dom_vals)
+    if pdockq_vals:
+        out["pdockq"] = max(pdockq_vals)
+    if pdockq2_vals:
+        out["pdockq2"] = max(pdockq2_vals)
+    if lis_vals:
+        out["lis"] = max(lis_vals)
+    out["ipsae_pae_cutoff"] = float(pae_cutoff)
+    out["ipsae_dist_cutoff"] = float(dist_cutoff)
+    return out
+
+
 def _run_boltz(yaml_str: str, out_dir: Path, params: str) -> None:
     from subprocess import run
 
@@ -493,9 +940,19 @@ def _iter_structure_files(root: Path, recursive: bool) -> list[Path]:
         f
         for f in files
         if f.is_file()
-        and f.suffix.lower() in STRUCTURE_SUFFIXES
+        and _is_structure_file(f)
         and "Ranked" not in f.parts
     )
+
+
+def _design_item(path: Path) -> dict:
+    filename, content = _read_file_text(path)
+    return {
+        "name": _design_stem(path),
+        "filename": filename,
+        "content": content,
+        "source_path": str(path),
+    }
 
 
 def seq_identity(a: str, b: str) -> float:
@@ -585,9 +1042,27 @@ def validate_one(job: dict) -> dict:
                 row.update(
                     parse_interface_pae(pae, chain_lengths, binder_idx, target_idxs)
                 )
-            pred_chains = (
-                extract_chains(struct.name, struct.read_text()) if struct else {}
-            )
+            if struct and pae:
+                try:
+                    ipsae_dir = Path(job["out_dir"]) / "predictions" / name / "ipsae"
+                    row.update(
+                        compute_ipsae(
+                            pae,
+                            struct,
+                            binder_yaml,
+                            target_yaml_ids,
+                            output_dir=ipsae_dir,
+                            pae_cutoff=float(job.get("ipsae_pae_cutoff", 10.0)),
+                            dist_cutoff=float(job.get("ipsae_dist_cutoff", 10.0)),
+                        )
+                    )
+                except Exception as exc:
+                    print(f"ipSAE failed for {name}: {exc}")
+                    row["ipsae_error"] = str(exc)
+            pred_chains = {}
+            if struct:
+                filename, content = _read_file_text(struct)
+                pred_chains = extract_chains(filename, content)
             if pred_chains:
                 row["binder_plddt_complex"] = _mean_plddt(
                     pred_chains.get(binder_yaml)
@@ -603,7 +1078,16 @@ def validate_one(job: dict) -> dict:
                 pred_for_rmsd = dict(pred_chains)
                 if binder_yaml != binder and binder_yaml in pred_for_rmsd:
                     pred_for_rmsd[binder] = pred_for_rmsd[binder_yaml]
-                row.update(compute_rmsds(pred_for_rmsd, ref_chains, binder, targets))
+                row.update(
+                    compute_rmsds(
+                        pred_for_rmsd,
+                        ref_chains,
+                        binder,
+                        targets,
+                        job.get("motif_residues"),
+                        job.get("motif_indices"),
+                    )
+                )
 
             if job.get("run_monomer", True):
                 mono_dir = td_path / "monomer"
@@ -621,7 +1105,7 @@ def validate_one(job: dict) -> dict:
                     row["monomer_ptm"] = m.get("ptm")
                     row["monomer_confidence"] = m.get("confidence_score")
                 if m_struct and binder in ref_chains:
-                    m_chains = extract_chains(m_struct.name, m_struct.read_text())
+                    m_chains = extract_chains(*_read_file_text(m_struct))
                     m_id = binder if binder in m_chains else next(iter(m_chains))
                     pb, rb = _match_ca(m_chains[m_id], ref_chains[binder])
                     if pb is not None:
@@ -671,6 +1155,10 @@ def run_validation(
     use_msa: bool,
     run_monomer: bool,
     recursive: bool,
+    motif_residues: str | None = None,
+    motif_json: str | None = None,
+    ipsae_pae_cutoff: float = 10.0,
+    ipsae_dist_cutoff: float = 10.0,
 ) -> dict:
     """Load designs, run Boltz per design, write rankings.csv."""
     import csv
@@ -711,11 +1199,10 @@ def run_validation(
         if not files:
             raise FileNotFoundError(f"No PDB/CIF files under {mount}")
         for f in files:
-            loaded.append(
-                {"name": f.stem, "filename": f.name, "content": f.read_text()}
-            )
+            loaded.append(_design_item(f))
 
     t_chains = _chain_ids(target_chains)
+    explicit_motif = _parse_res_id_list(motif_residues)
     jobs = []
     seq_rows = []
     parse_errors = []
@@ -743,6 +1230,27 @@ def run_validation(
             target_seq = ":".join(chains[c]["sequence"] for c in tgt_ids if c in chains)
 
         binder_seq = chains[b_id]["sequence"]
+        if explicit_motif:
+            motif_ids = list(explicit_motif)
+        elif item.get("motif_residues"):
+            motif_ids = list(item["motif_residues"])
+        else:
+            motif_ids = _motif_residues_for_design(
+                item.get("source_path"),
+                b_id,
+                tgt_ids,
+                [],
+                motif_json,
+                volume_name,
+            )
+        motif_idxs = _motif_indices(
+            chains,
+            b_id,
+            motif_ids,
+            item.get("source_path"),
+            item.get("rfd3_filename"),
+            item.get("rfd3_content"),
+        )
         for cid, data in chains.items():
             role = "binder" if cid == b_id else ("target" if cid in tgt_ids else "other")
             seq_rows.append(
@@ -769,12 +1277,18 @@ def run_validation(
                 "params_str": params_str,
                 "use_msa": use_msa,
                 "run_monomer": run_monomer,
+                "motif_residues": motif_ids,
+                "motif_indices": motif_idxs,
+                "ipsae_pae_cutoff": ipsae_pae_cutoff,
+                "ipsae_dist_cutoff": ipsae_dist_cutoff,
                 "out_dir": str(out_dir),
             }
         )
 
     target_counts = Counter(j["target_seq"] for j in jobs)
+    n_motif = sum(1 for j in jobs if j.get("motif_residues"))
     print(f"Parsed {len(jobs)} designs; {len(parse_errors)} parse failures")
+    print(f"Motif residues resolved for {n_motif}/{len(jobs)} designs")
     print(f"Unique target sequences: {len(target_counts)}")
     if len(target_counts) > 1:
         print("WARNING: target sequences differ across designs:")
@@ -823,18 +1337,22 @@ def run_validation(
         r["max_binder_seq_identity"] = round(ident_max, 4) if seq else None
 
         iptm = r.get("binder_target_iptm") or r.get("iptm")
+        ipsae = r.get("ipsae")
         plddt = r.get("complex_plddt")
         rmsd = r.get("rmsd_binder_on_target")
-        if iptm is not None and plddt is not None:
+        interface = ipsae if ipsae is not None else iptm
+        if interface is not None and plddt is not None:
             rmsd_term = 1.0 / (1.0 + (rmsd if rmsd is not None else 0.0))
-            r["rank_score"] = float(iptm) * float(plddt) * rmsd_term
+            r["rank_score"] = float(interface) * float(plddt) * rmsd_term
         else:
             r["rank_score"] = None
 
         r["passes_filters"] = bool(
             not r.get("error")
-            and iptm is not None
-            and iptm >= 0.5
+            and (
+                (ipsae is not None and ipsae >= 0.5)
+                or (ipsae is None and iptm is not None and iptm >= 0.5)
+            )
             and plddt is not None
             and plddt >= 0.7
             and (rmsd is None or rmsd <= 4.0)
@@ -845,6 +1363,7 @@ def run_validation(
         key=lambda r: (
             1 if r.get("error") else 0,
             -(r.get("rank_score") if r.get("rank_score") is not None else -1.0),
+            -(r.get("ipsae") if r.get("ipsae") is not None else -1.0),
             -(
                 r.get("binder_target_iptm")
                 if r.get("binder_target_iptm") is not None
@@ -874,6 +1393,13 @@ def run_validation(
         "target_plddt_complex",
         "ptm",
         "confidence_score",
+        "ipsae",
+        "ipsae_min",
+        "ipsae_d0chn",
+        "ipsae_d0dom",
+        "pdockq",
+        "pdockq2",
+        "lis",
         "interface_pae_mean",
         "interface_pae_min",
         "complex_ipde",
@@ -883,6 +1409,11 @@ def run_validation(
         "tm_complex",
         "rmsd_binder_fold",
         "tm_binder_fold",
+        "rmsd_motif",
+        "tm_motif",
+        "rmsd_motif_on_target",
+        "tm_motif_on_target",
+        "n_motif_residues",
         "monomer_plddt",
         "monomer_ptm",
         "rmsd_binder_monomer",
@@ -954,6 +1485,10 @@ def main(
     diffusion_samples: int = 1,
     use_potentials: bool = False,
     out_dir: str = "./out/boltz_validate",
+    motif_residues: str | None = None,
+    motif_json: str | None = None,
+    ipsae_pae_cutoff: float = 10.0,
+    ipsae_dist_cutoff: float = 10.0,
 ):
     """Validate binder designs with Boltz-2.
 
@@ -961,7 +1496,7 @@ def main(
         input_dir: Folder of PDB/CIF designs. Path on the volume if
             --volume-name is set, otherwise a local folder.
         volume_name: Modal Volume that holds the designs (bindcraft,
-            proteinhunter, or DESIGN_VOLUME).
+            bindcraft2, proteinhunter, rfd3, or DESIGN_VOLUME).
         binder_chain: Binder chain ID in each design (default B).
         target_chains: Comma-separated target chain IDs (default A).
         target_pdb: Target structure if designs are binder-only.
@@ -975,6 +1510,13 @@ def main(
         diffusion_samples: Number of Boltz samples (1 default; 5+ is more robust).
         use_potentials: Enable Boltz-2x inference-time potentials.
         out_dir: Local directory for the downloaded rankings.csv.
+        motif_residues: Comma-separated motif residue IDs (e.g. A4,A6,A18)
+            applied to every design. Omit to read each RFD3 JSON's
+            diffused_index_map (recommended for motif scaffolding).
+        motif_json: One RFD3 metadata JSON with diffused_index_map. Per-design
+            sibling JSON next to the CIF (or parent of mpnn/) is used when omitted.
+        ipsae_pae_cutoff: PAE cutoff for ipSAE (Boltz default 10).
+        ipsae_dist_cutoff: CA–CA distance cutoff for ipSAE (Boltz default 10).
     """
     from datetime import datetime
 
@@ -1027,10 +1569,16 @@ def main(
         files = _iter_structure_files(root, recursive)
         if not files:
             raise FileNotFoundError(f"No PDB/CIF files in {root}")
-        designs = [
-            {"name": f.stem, "filename": f.name, "content": f.read_text()}
-            for f in files
-        ]
+        t_ids = _chain_ids(target_chains)
+        explicit = _parse_res_id_list(motif_residues)
+        designs = []
+        for f in files:
+            item = _design_item(f)
+            item["motif_residues"] = _motif_residues_for_design(
+                str(f), binder_chain, t_ids, explicit, motif_json
+            )
+            _attach_rfd3_sidecar(item, f)
+            designs.append(item)
         print(f"Loaded {len(designs)} local structure(s) from {root}")
     else:
         print(f"Reading designs from volume '{volume_name}' at {input_dir}")
@@ -1056,6 +1604,10 @@ def main(
         use_msa=do_msa,
         run_monomer=do_monomer,
         recursive=recursive,
+        motif_residues=motif_residues,
+        motif_json=motif_json,
+        ipsae_pae_cutoff=ipsae_pae_cutoff,
+        ipsae_dist_cutoff=ipsae_dist_cutoff,
     ).get()
 
     local = Path(out_dir) / run_name
